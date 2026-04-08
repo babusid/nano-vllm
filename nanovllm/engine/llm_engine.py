@@ -76,7 +76,9 @@ class LLMEngine:
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
+                    decode_throughput = 0
                 else:
+                    prefill_throughput = 0
                     decode_throughput = -num_tokens / (perf_counter() - t)
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",

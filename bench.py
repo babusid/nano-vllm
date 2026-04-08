@@ -27,7 +27,7 @@ def main():
     torch.cuda.synchronize()
 
     t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    llm.generate(prompt_token_ids, sampling_params, use_tqdm=True)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     torch.cuda.synchronize()
     t = time.time() - t
