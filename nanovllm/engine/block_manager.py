@@ -90,6 +90,39 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    def can_allocate_spec(self, seq: Sequence, n_tokens: int) -> bool:
+        N = len(seq)
+        blocks_needed = 0
+        for i in range(n_tokens):
+            pos = N + i
+            block_index = pos // self.block_size
+            if len(seq.block_table) <= block_index:
+                blocks_needed += 1
+        return len(self.free_block_ids) >= blocks_needed
+
+    def allocate_slots_for_spec(self, seq: Sequence, n_tokens: int) -> None:
+        N = len(seq)
+        for i in range(n_tokens):
+            pos = N + i
+            block_index = pos // self.block_size
+            if len(seq.block_table) <= block_index:
+                if not self.free_block_ids:
+                    raise RuntimeError(
+                        "KV cache exhausted during specdec allocation"
+                    )
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                seq.block_table.append(block_id)
+
+    def trim_speculative_blocks(self, seq: Sequence) -> None:
+        num_needed = (len(seq) + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > num_needed:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 

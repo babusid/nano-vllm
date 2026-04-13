@@ -39,6 +39,12 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
+        # Speculative decoding
+        self.speculative_decoder = None
+        if config.speculative_method == "medusa" and rank == 0:
+            self._init_medusa(config, hf_config)
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -208,6 +214,138 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+
+    def _init_medusa(self, config, hf_config):
+        from nanovllm.speculative.medusa import MedusaDecoder, MedusaHeads, load_medusa_heads
+
+        vocab_size = hf_config.vocab_size
+        hidden_size = hf_config.hidden_size
+        heads = MedusaHeads(
+            num_heads=config.medusa_num_heads,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            num_layers=config.medusa_num_layers,
+        ).to(dtype=self.model_dtype, device="cuda")
+
+        load_medusa_heads(heads, config.model, config.medusa_model_path)
+
+        # Weight-tie lm_head to the base model's lm_head weight
+        base_lm_head_weight = self.model.lm_head.weight
+        self.speculative_decoder = MedusaDecoder(heads, base_lm_head_weight)
+        print(
+            f"[MEDUSA] Initialised {config.medusa_num_heads} draft head(s) "
+            f"({config.medusa_num_layers} ResBlock layer(s) each)."
+        )
+
+    def prepare_verify(
+        self,
+        seqs: list[Sequence],
+        full_drafts: list[list[int]],
+    ):
+
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+
+        for seq, drafts in zip(seqs, full_drafts):
+            N = len(seq)
+            K_plus_1 = len(drafts)
+
+            input_ids.extend(drafts)
+            positions.extend(range(N, N + K_plus_1))
+
+            for i in range(K_plus_1):
+                pos = N + i
+                block_index = pos // self.block_size
+                pos_in_block = pos % self.block_size
+                slot = seq.block_table[block_index] * self.block_size + pos_in_block
+                slot_mapping.append(slot)
+
+            cu_seqlens_q.append(cu_seqlens_q[-1] + K_plus_1)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + N + K_plus_1)
+            max_seqlen_q = max(K_plus_1, max_seqlen_q)
+            max_seqlen_k = max(N + K_plus_1, max_seqlen_k)
+
+        block_tables = self.prepare_block_tables(seqs)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            all_logits=True,
+        )
+        return input_ids, positions
+
+    @torch.inference_mode()
+    def run_speculative(self, seqs: list[Sequence]) -> tuple[list[list[int]], dict]:
+
+        K = self.config.medusa_num_heads
+
+        # Draft pass
+        input_ids, positions = self.prepare_decode(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+
+        # Run base model
+        hidden_states = self.model(input_ids, positions)  # [bs, hidden_size]
+        reset_context()
+
+        if self.rank == 0:
+            logits = self.model.compute_logits(hidden_states)  # [bs, vocab_size]
+            d0_tokens = self.sampler(logits, temperatures).tolist()
+
+            # MEDUSA draft heads
+            draft_output = self.speculative_decoder.draft(hidden_states, seqs)
+            full_drafts = [
+                [d0] + cs
+                for d0, cs in zip(d0_tokens, draft_output.draft_tokens)
+            ]
+            draft_output.draft_tokens = full_drafts
+
+        # Broadcast full_drafts so all ranks run the same verification inputs
+        if self.world_size > 1:
+            bs = len(seqs)
+            if self.rank == 0:
+                draft_tensor = torch.tensor(
+                    full_drafts, dtype=torch.int64, device="cuda"
+                )
+            else:
+                draft_tensor = torch.zeros(
+                    bs, K + 1, dtype=torch.int64, device="cuda"
+                )
+            dist.broadcast(draft_tensor, src=0)
+            if self.rank != 0:
+                full_drafts = draft_tensor.tolist()
+
+        # Verification pass
+        verify_input_ids, verify_positions = self.prepare_verify(seqs, full_drafts)
+        verify_hidden = self.model(verify_input_ids, verify_positions)
+        verify_logits = self.model.compute_logits(verify_hidden)
+        reset_context()
+
+        if self.rank == 0:
+            # Accept/reject
+            accept_output = self.speculative_decoder.verify(
+                seqs, draft_output, verify_logits, temperatures
+            )
+            return accept_output.accepted_tokens, accept_output.metrics
+
+        return None, None
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)

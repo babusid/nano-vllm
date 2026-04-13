@@ -69,3 +69,32 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def allocate_spec_slots(self, seqs: list[Sequence], n_tokens: int) -> None:
+        for seq in seqs:
+            if self.block_manager.can_allocate_spec(seq, n_tokens):
+                self.block_manager.allocate_slots_for_spec(seq, n_tokens)
+
+    def postprocess_speculative(
+        self,
+        seqs: list[Sequence],
+        accepted_tokens_list: list[list[int]],
+    ) -> None:
+
+        for seq, accepted in zip(seqs, accepted_tokens_list):
+            for token_id in accepted:
+                seq.append_token(token_id)
+                finished = (
+                    (not seq.ignore_eos and token_id == self.eos)
+                    or seq.num_completion_tokens == seq.max_tokens
+                )
+                if finished:
+                    seq.status = SequenceStatus.FINISHED
+                    break
+
+            # Release overallocated blocks
+            self.block_manager.trim_speculative_blocks(seq)
+
+            if seq.is_finished:
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
