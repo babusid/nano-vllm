@@ -38,6 +38,8 @@ image = (
         "transformers==4.51.0",
         "huggingface_hub>=0.25.0",
         "xxhash",
+        "tiktoken",
+        "sentencepiece",
     )
     .run_commands(
         "python -m pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl' || python -m pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp311-cp311-linux_x86_64.whl'",
