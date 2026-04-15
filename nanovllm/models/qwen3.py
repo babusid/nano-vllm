@@ -11,8 +11,30 @@ from nanovllm.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.layers.rotary_embedding import RotaryEmbedding, get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+
+
+class Qwen3RMSNorm(RMSNorm):
+    @torch.compile
+    def rms_forward(self, x):
+        return RMSNorm.rms_forward(self, x)
+
+    @torch.compile
+    def add_rms_forward(self, x, residual):
+        return RMSNorm.add_rms_forward(self, x, residual)
+
+
+class Qwen3SiluAndMul(SiluAndMul):
+    @torch.compile
+    def forward(self, x):
+        return SiluAndMul.forward(self, x)
+
+
+class Qwen3RotaryEmbedding(RotaryEmbedding):
+    @torch.compile
+    def forward(self, positions, query, key):
+        return RotaryEmbedding.forward(self, positions, query, key)
 
 
 class Qwen3Attention(nn.Module):
@@ -61,6 +83,7 @@ class Qwen3Attention(nn.Module):
             max_position=max_position,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            cls=Qwen3RotaryEmbedding,
         )
         self.attn = Attention(
             self.num_heads,
@@ -69,8 +92,8 @@ class Qwen3Attention(nn.Module):
             self.num_kv_heads,
         )
         if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.q_norm = Qwen3RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = Qwen3RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -111,7 +134,7 @@ class Qwen3MLP(nn.Module):
             bias=False,
         )
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        self.act_fn = Qwen3SiluAndMul()
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
@@ -143,8 +166,8 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -177,7 +200,7 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,

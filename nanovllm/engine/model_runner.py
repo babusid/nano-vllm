@@ -14,6 +14,18 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
+class Qwen3Sampler(Sampler):
+    @torch.compile
+    def forward(self, logits, temperatures):
+        return Sampler.forward(self, logits, temperatures)
+
+
+class VicunaSampler(Sampler):
+    @torch.compile
+    def forward(self, logits, temperatures):
+        return Sampler.forward(self, logits, temperatures)
+
+
 class ModelRunner:
 
     def __init__(
@@ -58,7 +70,12 @@ class ModelRunner:
                 "nano-vllm supports qwen3 and llama (e.g. Vicuna) checkpoints."
             )
         load_model(self.model, config.model)
-        self.sampler = Sampler()
+        if model_type == "qwen3":
+            self.sampler = Qwen3Sampler()
+        elif model_type == "llama":
+            self.sampler = VicunaSampler()
+        else:
+            self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
