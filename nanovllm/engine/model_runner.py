@@ -34,9 +34,11 @@ class ModelRunner:
         rank: int,
         event: Event | list[Event],
         block_managers: list[BlockManager] | None = None,
+        block_table_idx: int = 0,
     ):
         self.config = config
         self.block_managers = block_managers if block_managers is not None else []
+        self.block_table_idx = block_table_idx
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -144,9 +146,18 @@ class ModelRunner:
         num_seqs = min(
             max_num_batched_tokens // max_model_len, self.config.max_num_seqs
         )
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        seqs = [
+            Sequence(
+                token_ids=[0] * max_model_len,
+                num_block_tables=self.block_table_idx + 1,
+            )
+            for _ in range(num_seqs)
+        ]
         self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    def _block_table(self, seq: Sequence) -> list[int]:
+        return seq.block_tables[self.block_table_idx]
 
     def allocate_kv_cache(self):
         config = self.config
@@ -192,9 +203,10 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
+        max_len = max(len(self._block_table(seq)) for seq in seqs)
         block_tables = [
-            seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs
+            self._block_table(seq) + [-1] * (max_len - len(self._block_table(seq)))
+            for seq in seqs
         ]
         block_tables = torch.tensor(
             block_tables, dtype=torch.int32, pin_memory=True
@@ -211,6 +223,7 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
+            block_table = self._block_table(seq)
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens :])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
@@ -220,10 +233,10 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:  # warmup
+            if not block_table:  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
+                start = block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
@@ -264,11 +277,12 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
+            block_table = self._block_table(seq)
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(
-                seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+                block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True

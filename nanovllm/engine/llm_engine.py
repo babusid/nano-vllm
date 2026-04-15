@@ -50,6 +50,7 @@ class LLMEngine:
                     "rank": i,
                     "event": event,
                     "block_managers": self.block_managers,
+                    "block_table_idx": 0,
                 },
             )
             process.start()
@@ -69,6 +70,7 @@ class LLMEngine:
                 rank=0,
                 event=self.events,
                 block_managers=self.block_managers,
+                block_table_idx=0,
             )
         )
 
@@ -92,6 +94,7 @@ class LLMEngine:
                     rank=0,
                     event=self.events,
                     block_managers=self.block_managers,
+                    block_table_idx=1,
                 )
             )
             # idx should be length of current array
@@ -133,7 +136,16 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runners[0].call("run", seqs, is_prefill)
+        # TODO: gate behavior base don speculation mode
+        if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            all_token_ids = []
+            for mr in self.model_runners:
+                token_ids = mr.call("run", seqs, is_prefill)
+                all_token_ids.append(token_ids)
+            token_ids = all_token_ids[0]  # TODO: temporary
+        else:
+            token_ids = self.model_runners[0].call("run", seqs, is_prefill)
+
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
