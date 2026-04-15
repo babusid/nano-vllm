@@ -55,11 +55,16 @@ image = (
 )
 
 
-def _download_model(repo_id: str, revision: str = "") -> str:
+def _download_model(repo_id: str, revision: str = "", enable_cache: bool = True) -> str:
+    import os
     from huggingface_hub import snapshot_download
 
     model_name = repo_id.rstrip("/").split("/")[-1]
     model_path = f"/root/huggingface/{model_name}"
+    if os.path.isfile(os.path.join(model_path, "config.json")) and enable_cache:
+        print(f"using cached mode: {model_path}")
+        return model_path
+
     download_kwargs = {"repo_id": repo_id, "local_dir": model_path}
     if revision:
         download_kwargs["revision"] = revision
@@ -75,8 +80,6 @@ def _download_model(repo_id: str, revision: str = "") -> str:
 )
 def run_target(
     target: str,
-    model: str,
-    revision: str = "",
     main_model: str = "",
     main_revision: str = "",
     spec_model: str = "",
@@ -89,13 +92,10 @@ def run_target(
         raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
     print("Target: ", target)
     env = os.environ.copy()
-    if target == "bench":
-        main_repo = main_model or "Qwen/Qwen3-8B"
-        spec_repo = spec_model or "Qwen/Qwen3-0.6B"
-        env["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
-        env["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
-    else:
-        env["MODEL_PATH"] = _download_model(model, revision)
+    main_repo = main_model or "Qwen/Qwen3-8B"
+    spec_repo = spec_model or "Qwen/Qwen3-0.6B"
+    env["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
+    env["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
 
     result = subprocess.run(
         ["python", f"/workspace/{target}.py"],
@@ -110,8 +110,6 @@ def run_target(
 @app.local_entrypoint()
 def main(
     target: str = "bench",
-    model: str = "Qwen/Qwen3-0.6B",
-    revision: str = "",
     main_model: str = "Qwen/Qwen3-8B",
     main_revision: str = "",
     spec_model: str = "Qwen/Qwen3-0.6B",
@@ -120,8 +118,6 @@ def main(
     try:
         returncode, stdout, stderr = run_target.remote(
             target,
-            model,
-            revision,
             main_model,
             main_revision,
             spec_model,
