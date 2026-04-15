@@ -8,9 +8,22 @@ from nanovllm.config import Config
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.vicuna import VicunaForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+
+class Qwen3Sampler(Sampler):
+    @torch.compile
+    def forward(self, logits, temperatures):
+        return Sampler.forward(self, logits, temperatures)
+
+
+class VicunaSampler(Sampler):
+    @torch.compile
+    def forward(self, logits, temperatures):
+        return Sampler.forward(self, logits, temperatures)
 
 
 class ModelRunner:
@@ -46,9 +59,23 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.model_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type == "qwen3":
+            self.model = Qwen3ForCausalLM(hf_config)
+        elif model_type == "llama":
+            self.model = VicunaForCausalLM(hf_config)
+        else:
+            raise NotImplementedError(
+                f"Unsupported model_type {model_type!r}; "
+                "nano-vllm supports qwen3 and llama (e.g. Vicuna) checkpoints."
+            )
         load_model(self.model, config.model)
-        self.sampler = Sampler()
+        if model_type == "qwen3":
+            self.sampler = Qwen3Sampler()
+        elif model_type == "llama":
+            self.sampler = VicunaSampler()
+        else:
+            self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
