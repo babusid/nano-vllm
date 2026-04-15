@@ -26,7 +26,9 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+        )
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -34,7 +36,6 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
     def forward(
         self,
         positions: torch.Tensor,
@@ -63,8 +64,9 @@ def _get_rope_cached(
     max_position: int,
     base: float,
     rope_scaling_key,
+    cls: type = RotaryEmbedding,
 ):
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    rotary_emb = cls(head_size, rotary_dim, max_position, base)
     return rotary_emb
 
 
@@ -74,6 +76,7 @@ def get_rope(
     max_position: int,
     base: float,
     rope_scaling: dict | None = None,
+    cls: type = RotaryEmbedding,
 ):
     rope_scaling_key = _freeze(rope_scaling)
-    return _get_rope_cached(head_size, rotary_dim, max_position, base, rope_scaling_key)
+    return _get_rope_cached(head_size, rotary_dim, max_position, base, rope_scaling_key, cls)
