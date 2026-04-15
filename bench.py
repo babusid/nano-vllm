@@ -17,8 +17,10 @@ def main():
 
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
-        os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-8B/")
+        os.environ.get("MAIN_MODEL_PATH")
+        or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-8B/")
     )
+    print("Main Model Path: ", main_model_path)
     main_model_config = Config(
         model=main_model_path,
         max_model_len=4096,
@@ -26,8 +28,9 @@ def main():
         gpu_memory_utilization=0.8,
     )
     small_model_path = os.path.expanduser(
-        os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
+        os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
     )
+    print("Small Model Path: ", small_model_path)
     small_model_config = Config(
         model=small_model_path,
         max_model_len=4096,

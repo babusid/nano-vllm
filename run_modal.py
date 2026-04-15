@@ -5,14 +5,17 @@ Setup (one-time):
     modal setup
 
 Usage:
-    # Run benchmark script
+    # Run benchmark script (8B main + 0.6B speculator by default)
     modal run run_modal.py --target bench
 
-    # Run example script
+    # Run example script (single model)
     modal run run_modal.py --target example
 
-    # Use a different Hugging Face model and revision
-    modal run run_modal.py --target bench --model "Qwen/Qwen3-0.6B" --revision "main"
+    # Run benchmark with custom models
+    modal run run_modal.py --target bench --main-model "Qwen/Qwen3-8B" --spec-model "Qwen/Qwen3-0.6B"
+
+    # Run example with custom model and revision
+    modal run run_modal.py --target example --model "Qwen/Qwen3-0.6B" --revision "main"
 """
 
 from __future__ import annotations
@@ -50,34 +53,47 @@ image = (
 )
 
 
+def _download_model(repo_id: str, revision: str = "") -> str:
+    from huggingface_hub import snapshot_download
+
+    model_name = repo_id.rstrip("/").split("/")[-1]
+    model_path = f"/root/huggingface/{model_name}"
+    download_kwargs = {"repo_id": repo_id, "local_dir": model_path}
+    if revision:
+        download_kwargs["revision"] = revision
+    snapshot_download(**download_kwargs)
+    return model_path
+
+
 @app.function(
     image=image,
     gpu="B200:1",
     timeout=7200,
     volumes={"/root/huggingface": hf_volume},
 )
-def run_target(target: str, model: str, revision: str = "") -> tuple[int, str, str]:
+def run_target(
+    target: str,
+    model: str,
+    revision: str = "",
+    main_model: str = "",
+    main_revision: str = "",
+    spec_model: str = "",
+    spec_revision: str = "",
+) -> tuple[int, str, str]:
     import os
     import subprocess
 
-    from huggingface_hub import snapshot_download
-
     if target not in {"bench", "example"}:
         raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
-
-    model_name = model.rstrip("/").split("/")[-1]
-    model_path = f"/root/huggingface/{model_name}"
-
-    download_kwargs = {
-        "repo_id": model,
-        "local_dir": model_path,
-    }
-    if revision:
-        download_kwargs["revision"] = revision
-    snapshot_download(**download_kwargs)
-
+    print("Target: ", target)
     env = os.environ.copy()
-    env["MODEL_PATH"] = model_path
+    if target == "bench":
+        main_repo = main_model or "Qwen/Qwen3-8B"
+        spec_repo = spec_model or "Qwen/Qwen3-0.6B"
+        env["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
+        env["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    else:
+        env["MODEL_PATH"] = _download_model(model, revision)
 
     result = subprocess.run(
         ["python", f"/workspace/{target}.py"],
@@ -90,9 +106,25 @@ def run_target(target: str, model: str, revision: str = "") -> tuple[int, str, s
 
 
 @app.local_entrypoint()
-def main(target: str = "bench", model: str = "Qwen/Qwen3-0.6B", revision: str = ""):
+def main(
+    target: str = "bench",
+    model: str = "Qwen/Qwen3-0.6B",
+    revision: str = "",
+    main_model: str = "Qwen/Qwen3-8B",
+    main_revision: str = "",
+    spec_model: str = "Qwen/Qwen3-0.6B",
+    spec_revision: str = "",
+):
     try:
-        returncode, stdout, stderr = run_target.remote(target, model, revision)
+        returncode, stdout, stderr = run_target.remote(
+            target,
+            model,
+            revision,
+            main_model,
+            main_revision,
+            spec_model,
+            spec_revision,
+        )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")
         sys.exit(1)

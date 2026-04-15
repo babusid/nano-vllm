@@ -90,7 +90,6 @@ class LLMEngine:
                     "Naive Speculation with multiple models not supported"
                 )
             speculator_config[0].eos = self.tokenizer.eos_token_id
-            print(speculator_config[0])
             self.model_runners.append(
                 ModelRunner(
                     config=speculator_config[0],
@@ -99,7 +98,6 @@ class LLMEngine:
                     block_managers=self.block_managers,
                 )
             )
-            print(speculator_config[0])
             self.block_managers.append(
                 BlockManager(
                     num_blocks=speculator_config[0].num_kvcache_blocks,
