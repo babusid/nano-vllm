@@ -1,7 +1,7 @@
 import os
 import time
 from random import randint, seed
-
+from nanovllm.config import Config
 import torch
 from nanovllm import LLM, SamplingParams
 
@@ -15,7 +15,11 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser(os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.6B/"))
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    main_model_config = Config(model=path, max_model_len=4096, enforce_eager=False)
+    llm = LLM(
+        model=path,
+        model_config=main_model_config,
+    )
 
     prompt_token_ids = [
         [randint(0, 10000) for _ in range(randint(100, max_input_len))]

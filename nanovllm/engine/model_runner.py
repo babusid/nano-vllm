@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -14,8 +15,15 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        event: Event | list[Event],
+        block_manager: BlockManager | None = None,
+    ):
         self.config = config
+        self.block_manager = block_manager
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager

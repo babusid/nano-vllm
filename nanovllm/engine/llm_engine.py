@@ -10,28 +10,69 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.block_manager import BlockManager
 
 
 class LLMEngine:
-    """LLMEngine is the main class for running a vLLM model."""
+    def __init__(
+        self,
+        model: str,
+        model_config: Config,
+        speculation_mode: str | None = None,
+        speculation_model: list[str] | None = None,
+        speculator_config: list[Config] | None = None,
+        **kwargs,
+    ):
+        # tensor parallelism bookkeeping
+        # disable TP with specdecode for now
+        if speculation_mode is not None and model_config.tensor_parallel_size > 1:
+            raise NotImplementedError("Speculation not supported with TP")
 
-    def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        for i in range(1, model_config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(
+                target=ModelRunner,
+                kwargs={
+                    "config": model_config,
+                    "rank": i,
+                    "event": event,
+                    "block_manager": None,
+                },
+            )
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+
+        # setup tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_config.model, use_fast=True
+        )
+        model_config.eos = self.tokenizer.eos_token_id
+
+        # setup model runner(s), one for each model instance that we need to run
+        self.model_runner = ModelRunner(
+            config=model_config,
+            rank=0,
+            event=self.events,
+            block_manager=None,
+        )
+
+        self.block_manager = BlockManager(
+            num_blocks=model_config.num_kvcache_blocks,
+            block_size=model_config.kvcache_block_size,
+        )
+        self.model_runner.block_manager = self.block_manager
+
+        # setup scheduler with access to all block managers
+        self.scheduler = Scheduler(
+            config=model_config,
+            block_manager=self.block_manager,
+        )
+
+        # register cleanup hook for tp processes
         atexit.register(self.exit)
 
     def exit(self):
