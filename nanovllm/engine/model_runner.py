@@ -20,24 +20,28 @@ class ModelRunner:
         config: Config,
         rank: int,
         event: Event | list[Event],
-        block_manager: BlockManager | None = None,
+        block_managers: list[BlockManager] | None = None,
     ):
         self.config = config
-        self.block_manager = block_manager
+        self.block_managers = block_managers if block_managers is not None else []
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self._owns_process_group = False
         model_dtype = getattr(hf_config, "dtype", None)
         if model_dtype is None:
             model_dtype = hf_config.torch_dtype
         self.model_dtype = model_dtype
 
-        dist.init_process_group(
-            "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
-        )
+        if not dist.is_initialized():
+            dist.init_process_group(
+                "nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank
+            )
+            self._owns_process_group = True
+
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.model_dtype)
@@ -70,7 +74,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if self._owns_process_group and dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -120,9 +125,6 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(
             hf_config,
@@ -137,11 +139,16 @@ class ModelRunner:
             * head_dim
             * torch.tensor([], dtype=self.model_dtype).element_size()
         )
-        config.num_kvcache_blocks = (
-            int(total * config.gpu_memory_utilization - used - peak + current)
-            // block_bytes
-        )
-        assert config.num_kvcache_blocks > 0
+        available_bytes = int(free * config.gpu_memory_utilization)
+        config.num_kvcache_blocks = available_bytes // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            free_gib = free / (1024**3)
+            block_mib = block_bytes / (1024**2)
+            raise ValueError(
+                "Insufficient GPU memory for KV cache allocation: "
+                f"free={free_gib:.2f}GiB, util={config.gpu_memory_utilization:.3f}, "
+                f"block_size={block_mib:.2f}MiB"
+            )
         self.kv_cache = torch.empty(
             2,
             hf_config.num_hidden_layers,

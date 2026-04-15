@@ -4,6 +4,7 @@ from random import randint, seed
 from nanovllm.config import Config
 import torch
 from nanovllm import LLM, SamplingParams
+from nanovllm.engine.llm_engine import SpeculationMode
 
 # from vllm import LLM, SamplingParams
 
@@ -14,11 +15,32 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser(os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.6B/"))
-    main_model_config = Config(model=path, max_model_len=4096, enforce_eager=False)
+    # size memory pool to add up to 90% of GPU memory
+    main_model_path = os.path.expanduser(
+        os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-8B/")
+    )
+    main_model_config = Config(
+        model=main_model_path,
+        max_model_len=4096,
+        enforce_eager=False,
+        gpu_memory_utilization=0.8,
+    )
+    small_model_path = os.path.expanduser(
+        os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
+    )
+    small_model_config = Config(
+        model=small_model_path,
+        max_model_len=4096,
+        enforce_eager=False,
+        gpu_memory_utilization=0.5,
+    )
+
     llm = LLM(
-        model=path,
+        model=main_model_path,
         model_config=main_model_config,
+        speculation_mode=SpeculationMode.NAIVE_SPECULATION,
+        speculation_model=[small_model_path],
+        speculator_config=[small_model_config],
     )
 
     prompt_token_ids = [

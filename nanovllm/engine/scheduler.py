@@ -6,13 +6,13 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
-    def __init__(self, config: Config, block_manager: BlockManager):
+    def __init__(self, config: Config, block_managers: list[BlockManager]):
         self.max_num_seqs = config.max_num_seqs  # batch size in sequences
         self.max_num_batched_tokens = (
             config.max_num_batched_tokens
         )  # batch size in tokens
         self.eos = config.eos  # end of sequence token id
-        self.block_manager = block_manager  # setup the memory pool
+        self.block_manager = block_managers[0]  # setup the memory pool
         self.waiting: deque[Sequence] = deque()  # manage waiting and running sequences
         self.running: deque[Sequence] = deque()
 
