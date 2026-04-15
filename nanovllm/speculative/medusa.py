@@ -274,8 +274,16 @@ def load_medusa_heads(
     from safetensors.torch import load_file
 
     candidates = []
+    # Direct file path supplied by the caller
     if medusa_model_path and os.path.isfile(medusa_model_path):
         candidates.append(medusa_model_path)
+    # medusa_model_path can also be a directory (e.g. a downloaded HF repo)
+    if medusa_model_path and os.path.isdir(medusa_model_path):
+        candidates.append(os.path.join(medusa_model_path, "medusa_lm_head.pt"))
+        candidates.append(os.path.join(medusa_model_path, "medusa_heads.safetensors"))
+        candidates.append(os.path.join(medusa_model_path, "medusa_heads.pt"))
+    # Fall back to files co-located with the base model
+    candidates.append(os.path.join(model_path, "medusa_lm_head.pt"))
     candidates.append(os.path.join(model_path, "medusa_heads.safetensors"))
     candidates.append(os.path.join(model_path, "medusa_heads.pt"))
 
@@ -296,16 +304,59 @@ def load_medusa_heads(
     if ckpt_path.endswith(".safetensors"):
         state_dict = load_file(ckpt_path)
     else:
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        try:
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        except Exception:
+            # Older checkpoints may require full unpickling
+            state_dict = torch.load(ckpt_path, map_location="cpu")  # noqa: S614
 
-    # Strip an optional "medusa_heads." prefix so the dict matches MedusaHeads
-    cleaned = {}
-    for k, v in state_dict.items():
-        key = k.removeprefix("medusa_heads.")
-        cleaned[key] = v
+    cleaned = _translate_keys(state_dict)
 
     missing, unexpected = heads.load_state_dict(cleaned, strict=False)
     if missing:
         print(f"[MEDUSA] Missing keys (will use random init): {missing}")
     if unexpected:
         print(f"[MEDUSA] Unexpected keys (ignored): {unexpected}")
+
+
+def _translate_keys(state_dict: dict) -> dict:
+    """Normalise a raw MEDUSA state dict to our MedusaHeads key convention.
+
+    Three source formats are handled:
+
+    1. Our own format (train_medusa_heads.py output):
+           heads.{i}.blocks.{j}.linear.{weight|bias}
+       → kept as-is.
+
+    2. Optional "medusa_heads." prefix (legacy nanovllm saves):
+           medusa_heads.{i}.blocks.{j}.linear.{weight|bias}
+       → strip the prefix.
+
+    3. Official FasterDecoding checkpoint (medusa_lm_head.pt):
+           {i}.{j}.linear.{weight|bias}   ← ResBlock
+           {i}.{num_layers}.weight        ← tied lm_head (skipped)
+       → mapped to heads.{i}.blocks.{j}.linear.{weight|bias}.
+
+    The official format is detected by the first key starting with a digit.
+    """
+    first_key = next(iter(state_dict), "")
+
+    # Format 3 — official FasterDecoding checkpoint
+    if first_key and first_key[0].isdigit():
+        translated: dict = {}
+        for k, v in state_dict.items():
+            parts = k.split(".")
+            # parts = [head_idx, block_idx, "linear", param]  ← ResBlock
+            # parts = [head_idx, block_idx, param]            ← final Linear (lm_head)
+            if len(parts) >= 4 and parts[2] == "linear":
+                head_idx, block_idx, _, param = parts[0], parts[1], parts[2], parts[3]
+                new_key = f"heads.{head_idx}.blocks.{block_idx}.linear.{param}"
+                translated[new_key] = v
+            # else: final Linear / lm_head weight — skipped (weight-tied to base model)
+        return translated
+
+    # Format 1 & 2 — strip optional "medusa_heads." prefix
+    cleaned: dict = {}
+    for k, v in state_dict.items():
+        cleaned[k.removeprefix("medusa_heads.")] = v
+    return cleaned

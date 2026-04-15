@@ -16,6 +16,15 @@ Usage:
 
     # Run example with custom model and revision
     modal run run_modal.py --target example --model "Qwen/Qwen3-0.6B" --revision "main"
+
+    # Run MEDUSA vs AR comparison benchmark (bench_speculative.py)
+    modal run run_modal.py --target bench_speculative --model "Qwen/Qwen3-0.6B" --extra-args "--method medusa --num-heads 4 --compare"
+
+    # MEDUSA with pretrained Vicuna-7B heads (FasterDecoding/medusa-vicuna-7b-v1.3)
+    modal run run_modal.py --target bench_speculative --model "lmsys/vicuna-7b-v1.3" --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" --extra-args "--method medusa --num-heads 5 --compare"
+
+    # AR baseline only
+    modal run run_modal.py --target bench_speculative --model "Qwen/Qwen3-0.6B"
 """
 
 from __future__ import annotations
@@ -67,6 +76,29 @@ def _download_model(repo_id: str, revision: str = "") -> str:
     return model_path
 
 
+def _download_medusa_heads(repo_id: str, revision: str = "") -> str:
+    """Download just the MEDUSA heads file and return the directory path.
+
+    The official FasterDecoding checkpoints store heads in medusa_lm_head.pt
+    inside the repo.  We download the full snapshot so the caller can point
+    load_medusa_heads() at the directory.
+    """
+    from huggingface_hub import snapshot_download
+
+    repo_name = repo_id.rstrip("/").split("/")[-1]
+    heads_path = f"/root/huggingface/{repo_name}"
+    download_kwargs = {
+        "repo_id": repo_id,
+        "local_dir": heads_path,
+        # Only fetch the heads file and config; skip large model shards
+        "ignore_patterns": ["*.bin", "*.safetensors", "pytorch_model*"],
+    }
+    if revision:
+        download_kwargs["revision"] = revision
+    snapshot_download(**download_kwargs)
+    return heads_path
+
+
 @app.function(
     image=image,
     gpu="B200:1",
@@ -81,12 +113,16 @@ def run_target(
     main_revision: str = "",
     spec_model: str = "",
     spec_revision: str = "",
+    extra_args: str = "",
+    medusa_heads_model: str = "",
+    medusa_heads_revision: str = "",
 ) -> tuple[int, str, str]:
     import os
     import subprocess
 
-    if target not in {"bench", "example"}:
-        raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
+    valid_targets = {"bench", "example", "bench_speculative"}
+    if target not in valid_targets:
+        raise ValueError(f"target must be one of {sorted(valid_targets)}, got {target!r}")
     print("Target: ", target)
     env = os.environ.copy()
     if target == "bench":
@@ -94,11 +130,24 @@ def run_target(
         spec_repo = spec_model or "Qwen/Qwen3-0.6B"
         env["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
         env["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    elif target == "bench_speculative":
+        # MEDUSA uses a single model; MODEL_PATH drives bench_speculative.py
+        repo = model or "Qwen/Qwen3-0.6B"
+        env["MODEL_PATH"] = _download_model(repo, revision)
+        # Optionally download pretrained MEDUSA heads from a separate HF repo
+        if medusa_heads_model:
+            heads_dir = _download_medusa_heads(medusa_heads_model, medusa_heads_revision)
+            env["MEDUSA_HEADS_PATH"] = heads_dir
+            print(f"[MEDUSA] Heads downloaded to {heads_dir}")
     else:
         env["MODEL_PATH"] = _download_model(model, revision)
 
+    cmd = ["python", f"/workspace/{target}.py"]
+    if extra_args:
+        cmd += extra_args.split()
+
     result = subprocess.run(
-        ["python", f"/workspace/{target}.py"],
+        cmd,
         cwd="/workspace",
         env=env,
         capture_output=True,
@@ -116,6 +165,9 @@ def main(
     main_revision: str = "",
     spec_model: str = "Qwen/Qwen3-0.6B",
     spec_revision: str = "",
+    extra_args: str = "",
+    medusa_heads_model: str = "",
+    medusa_heads_revision: str = "",
 ):
     try:
         returncode, stdout, stderr = run_target.remote(
@@ -126,6 +178,9 @@ def main(
             main_revision,
             spec_model,
             spec_revision,
+            extra_args,
+            medusa_heads_model,
+            medusa_heads_revision,
         )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")

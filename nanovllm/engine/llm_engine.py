@@ -111,10 +111,16 @@ class LLMEngine:
             block_managers=self.block_managers,
         )
 
+        # store config and speculation mode for use in step/generate
+        self.config = model_config
+        self.speculation_mode = speculation_mode
+
         # register cleanup hook for tp processes
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runners"):
+            return  # already cleaned up (e.g. explicit call before atexit fires)
         self.model_runners[0].call("exit")
         del self.model_runners
         for p in self.ps:
@@ -140,7 +146,7 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
 
         if is_prefill:
-            token_ids = self.model_runner.call("run", seqs, True)
+            token_ids = self.model_runners[0].call("run", seqs, True)
             self.scheduler.postprocess(seqs, token_ids)
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
             num_tokens = sum(len(seq) for seq in seqs)
@@ -151,7 +157,7 @@ class LLMEngine:
         self.scheduler.allocate_spec_slots(seqs, K + 1)
 
         # Run speculative decode
-        accepted_tokens_list, metrics = self.model_runner.call("run_speculative", seqs)
+        accepted_tokens_list, metrics = self.model_runners[0].call("run_speculative", seqs)
 
         self.scheduler.postprocess_speculative(seqs, accepted_tokens_list)
 
@@ -170,14 +176,25 @@ class LLMEngine:
         use_tqdm: bool = True,
         return_metrics: bool = False,
     ) -> list[dict]:
-        if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+
+        # Compute total output tokens we expect so the bar tracks token progress.
+        # Falls back to sequence count when max_tokens varies or is unknown.
+        total_expected_tokens = sum(sp.max_tokens for sp in sampling_params)
+        if use_tqdm:
+            pbar = tqdm(
+                total=total_expected_tokens,
+                desc="Generating",
+                unit="tok",
+                dynamic_ncols=True,
+            )
+
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
 
         use_spec = bool(self.config.speculative_method)
+        cumulative_metrics = {}
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
@@ -188,7 +205,6 @@ class LLMEngine:
                 _accumulate_metrics(cumulative_metrics, step_metrics)
             else:
                 output, num_tokens = self.step()
-                step_metrics = {}
 
             if use_tqdm:
                 if num_tokens > 0:
@@ -203,18 +219,21 @@ class LLMEngine:
                         "Decode": f"{int(decode_throughput)}tok/s",
                     }
                 )
+                # Advance by the number of new decode tokens this step.
+                if num_tokens < 0:
+                    pbar.update(-num_tokens)
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
-                if use_tqdm:
-                    pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [
             {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
             for token_ids in outputs
         ]
+        if return_metrics and cumulative_metrics and outputs:
+            outputs[0]["metrics"] = cumulative_metrics
         if use_tqdm:
             pbar.close()
-        return result
+        return outputs
 
 def _accumulate_metrics(cumulative: dict, step: dict) -> None:
     for key, val in step.items():

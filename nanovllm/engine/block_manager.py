@@ -192,11 +192,16 @@ class BlockManager:
                 block_table.append(block_id)
             # else: block already pre-allocated by speculative step; nothing to do.
         elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks - 1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+            # The last token filled the block exactly.  _finalize_completed_blocks
+            # (called from trim_speculative_blocks) may have already hashed it when
+            # multiple tokens were accepted in a single speculative step.  Skip if so.
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks - 1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
         else:
+            # Mid-block: should be unhashed, but _finalize_completed_blocks never
+            # touches partial blocks so this remains an invariant in practice.
             assert last_block.hash == -1
