@@ -39,10 +39,8 @@ def main():
     )
 
     llm = LLM(
-        model=main_model_path,
         model_config=main_model_config,
         speculation_mode=SpeculationMode.NAIVE_SPECULATION,
-        speculation_model=[small_model_path],
         speculator_config=[small_model_config],
     )
 

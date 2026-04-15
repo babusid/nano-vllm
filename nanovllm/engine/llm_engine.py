@@ -12,31 +12,26 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.block_manager import BlockManager
-from enum import Enum
-
-
-class SpeculationMode(Enum):
-    NAIVE_SPECULATION = "naive_speculation"
+from nanovllm.engine.speculation import SpeculationMode
 
 
 class LLMEngine:
     def __init__(
         self,
-        model: str,
         model_config: Config,
         speculation_mode: SpeculationMode | None = None,
-        speculation_model: list[str] | None = None,
         speculator_config: list[Config] | None = None,
         **kwargs,
     ):
+        self.speculation_mode = speculation_mode
+        self.model_config = model_config
+        self.speculator_config = speculator_config
         # tensor parallelism bookkeeping
         # disable TP with specdecode for now
         if speculation_mode is not None and model_config.tensor_parallel_size > 1:
             raise NotImplementedError("Speculation not supported with TP")
 
-        if speculation_mode is not None and (
-            speculator_config is None or speculation_model is None
-        ):
+        if speculation_mode is not None and speculator_config is None:
             raise ValueError(
                 "Speculator config and model is required for naive speculation"
             )
@@ -81,11 +76,12 @@ class LLMEngine:
             BlockManager(
                 num_blocks=model_config.num_kvcache_blocks,
                 block_size=model_config.kvcache_block_size,
+                block_table_idx=0,
             )
         )
 
         if speculation_mode is SpeculationMode.NAIVE_SPECULATION:
-            if len(speculation_model) > 1 or len(speculator_config) > 1:
+            if len(speculator_config) > 1:
                 raise NotImplementedError(
                     "Naive Speculation with multiple models not supported"
                 )
@@ -98,10 +94,13 @@ class LLMEngine:
                     block_managers=self.block_managers,
                 )
             )
+            # idx should be length of current array
+            block_table_idx = len(self.block_managers)
             self.block_managers.append(
                 BlockManager(
                     num_blocks=speculator_config[0].num_kvcache_blocks,
                     block_size=speculator_config[0].kvcache_block_size,
+                    block_table_idx=block_table_idx,
                 )
             )
 
@@ -109,6 +108,8 @@ class LLMEngine:
         self.scheduler = Scheduler(
             config=model_config,
             block_managers=self.block_managers,
+            speculation_mode=speculation_mode,
+            speculator_config=speculator_config,
         )
 
         # register cleanup hook for tp processes
@@ -123,7 +124,11 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(
+            token_ids=prompt,
+            sampling_params=sampling_params,
+            num_block_tables=len(self.block_managers),
+        )
         self.scheduler.add(seq)
 
     def step(self):
