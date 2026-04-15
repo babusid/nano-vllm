@@ -237,16 +237,13 @@ class MedusaDecoder(SpeculativeDecoder):
             total_steps += 1
             total_accepted += len(accepted)
 
+        # Only store raw counts — derived rates are computed at reporting time
+        # from the accumulated totals so that summing across steps remains correct.
         metrics = {
             "total_steps": total_steps,
             "total_accepted": total_accepted,
-            "mean_accepted_per_step": total_accepted / total_steps if total_steps else 0.0,
             "per_head_hits": per_head_hits,
             "per_head_tries": per_head_tries,
-            "per_head_acceptance_rate": [
-                h / t if t > 0 else 0.0
-                for h, t in zip(per_head_hits, per_head_tries)
-            ],
         }
 
         return AcceptOutput(accepted_tokens=accepted_tokens, metrics=metrics)

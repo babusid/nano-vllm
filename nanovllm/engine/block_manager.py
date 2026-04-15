@@ -115,6 +115,15 @@ class BlockManager:
                 seq.block_table.append(block_id)
 
     def trim_speculative_blocks(self, seq: Sequence) -> None:
+        """Free blocks allocated beyond the accepted length, then finalize any
+        blocks that crossed a boundary during the speculative step.
+
+        After accepting K' tokens, seq.num_tokens = N + K'.  Blocks that were
+        pre-allocated for positions N+K'..N+K are freed.  Blocks that are now
+        completely full but were never processed by may_append (because several
+        tokens were accepted at once) are finalized here so that the next call
+        to may_append sees the invariant it expects.
+        """
         num_needed = (len(seq) + self.block_size - 1) // self.block_size
         while len(seq.block_table) > num_needed:
             block_id = seq.block_table.pop()
@@ -123,6 +132,39 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
 
+        # Finalize every block that is now completely full.  _finalize_completed_blocks
+        # uses the sequence length to determine which blocks are full, so it naturally
+        # skips the (potentially partial) last block.
+        self._finalize_completed_blocks(seq)
+
+    def _finalize_completed_blocks(self, seq: Sequence) -> None:
+        """Finalize (hash) every block in block_table that is completely filled
+        by the current sequence but has not yet been hashed.
+
+        Unlike the old version that stopped before the last block, this version
+        processes ALL blocks including the last one — but only if the sequence
+        actually covers that block fully (i.e. len(seq) >= end of block).
+        Partial blocks (the active write target) are naturally skipped because
+        the sequence doesn't reach their end yet.
+
+        Processing left-to-right guarantees the prefix-hash chain is correct.
+        """
+        for i in range(len(seq.block_table)):
+            block_id = seq.block_table[i]
+            block = self.blocks[block_id]
+            if block.hash != -1:
+                continue  # already finalized
+            end_pos = (i + 1) * self.block_size
+            if end_pos > len(seq):
+                break  # block is only partially covered — stop here
+            token_ids = seq.block(i)
+            if len(token_ids) < self.block_size:
+                break  # safeguard: shouldn't happen, but don't hash partial data
+            prefix_hash = self.blocks[seq.block_table[i - 1]].hash if i > 0 else -1
+            h = self.compute_hash(token_ids, prefix_hash)
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block_id
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
@@ -130,16 +172,28 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
+            # Position len(seq)-1 is the first slot of a new block.
+            # Standard path: allocate that new block, first ensuring the
+            # previous (now-full) block is finalized.
+            # Speculative path: allocate_slots_for_spec may have pre-allocated
+            # this block already; detect that and skip the allocation.
+            already_allocated = len(block_table) * self.block_size >= len(seq)
+            if not already_allocated:
+                # Finalize the previous full block if somehow it wasn't yet
+                # (e.g. tokens were accepted in bulk crossing a boundary).
+                if last_block.hash == -1:
+                    self._finalize_completed_blocks(seq)
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                block_table.append(block_id)
+            # else: block already pre-allocated by speculative step; nothing to do.
         elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        else:
-            assert last_block.hash == -1
+            # Position len(seq)-1 is the last slot of the current block; finalize it.
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks - 1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
+            # else: already finalized (e.g. by _finalize_completed_blocks); nothing to do.
+        # else: block is partially filled — no structural change needed.

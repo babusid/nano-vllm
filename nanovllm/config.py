@@ -18,11 +18,11 @@ class Config:
     num_kvcache_blocks: int = -1
 
     # Speculative decoding specific configs
-    speculative_method: str = "medusa"     # TODO: add eagle  
-    num_speculative_tokens: int = 4    
+    speculative_method: str = ""           # "" = disabled (standard AR)
+    num_speculative_tokens: int = 4
     medusa_num_heads: int = 0
-    medusa_num_layers: int = 1         
-    medusa_model_path: str = ""        
+    medusa_num_layers: int = 1
+    medusa_model_path: str = ""
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

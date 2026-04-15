@@ -74,13 +74,23 @@ def run_benchmark(
         "mem_delta_mb": mem_after - mem_before,
     }
 
-    # Speculative metrics
+    # Speculative metrics — derive rates from raw accumulated counts so
+    # they remain correct regardless of how many decode steps were taken.
     if results and "metrics" in results[0]:
         m = results[0]["metrics"]
-        stats["mean_accepted_per_step"] = m.get("mean_accepted_per_step", 0)
-        stats["per_head_acceptance_rate"] = m.get("per_head_acceptance_rate", [])
-        stats["total_steps"] = m.get("total_steps", 0)
-        stats["total_accepted"] = m.get("total_accepted", 0)
+        total_steps   = m.get("total_steps", 0)
+        total_accepted = m.get("total_accepted", 0)
+        per_head_hits  = m.get("per_head_hits", [])
+        per_head_tries = m.get("per_head_tries", [])
+        stats["total_steps"]   = total_steps
+        stats["total_accepted"] = total_accepted
+        stats["mean_accepted_per_step"] = (
+            total_accepted / total_steps if total_steps else 0.0
+        )
+        stats["per_head_acceptance_rate"] = [
+            h / t if t > 0 else 0.0
+            for h, t in zip(per_head_hits, per_head_tries)
+        ]
 
     return stats
 
@@ -117,7 +127,7 @@ def print_stats(stats: dict) -> None:
         print(f"  Speedup vs AR      : {stats['speedup']:.2f}×")
     print(f"{'─' * 55}")
 
-    
+
 def parse_args():
     p = argparse.ArgumentParser(description="Speculative decoding benchmark")
     p.add_argument("--method", default="", choices=["", "medusa"],
@@ -172,6 +182,7 @@ def main():
                                    label="Baseline (autoregressive)")
         results_ar["ttft_s"] = ttft_ar
         print_stats(results_ar)
+        llm_ar.exit()   # tears down dist process group so the next LLM can init
         del llm_ar
         torch.cuda.empty_cache()
 
@@ -212,7 +223,7 @@ def main():
         print(f"  Spec throughput    : {results_spec['throughput_tok_s']:.1f} tok/s")
         print(f"  Speedup            : {results_spec.get('speedup', 0):.2f}×")
         if "mean_accepted_per_step" in results_spec:
-            print(f"  τ                  : {results_spec['mean_accepted_per_step']:.3f}")
+            print(f"  τ (mean accepted)  : {results_spec['mean_accepted_per_step']:.3f} tokens/step")
         print("═" * 55)
 
 

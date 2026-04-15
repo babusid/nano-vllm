@@ -35,6 +35,8 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner"):
+            return  # already cleaned up (e.g. explicit call before atexit fires)
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -111,8 +113,6 @@ class LLMEngine:
             else:
                 output, num_tokens = self.step()
                 step_metrics = {}
-
-            elapsed = 
 
             if use_tqdm:
                 if num_tokens > 0:
