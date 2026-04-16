@@ -27,7 +27,6 @@ class VicunaSampler(Sampler):
 
 
 class ModelRunner:
-
     def __init__(
         self,
         config: Config,
@@ -107,6 +106,8 @@ class ModelRunner:
             dist.destroy_process_group()
 
     def loop(self):
+        # used for non-rank 0 processes to run the methods
+        # specified in the shared memory by the rank 0 process
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
@@ -114,6 +115,7 @@ class ModelRunner:
                 break
 
     def read_shm(self):
+        # non-rank0 processes read the method name and arguments
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
@@ -122,6 +124,7 @@ class ModelRunner:
         return method_name, args
 
     def write_shm(self, method_name, *args):
+        # rank0 process writes the method name and arguments
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
@@ -131,6 +134,8 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        # reflection based call so that we can use
+        # method name in shmem instead of direct calls
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
@@ -157,6 +162,7 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _block_table(self, seq: Sequence) -> list[int]:
+        # get paired block table
         return seq.block_tables[self.block_table_idx]
 
     def allocate_kv_cache(self):
@@ -203,6 +209,9 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        # pads block tables to max length and stacks them
+        # together in a tensor to give a uniform tensor of block
+        # tables
         max_len = max(len(self._block_table(seq)) for seq in seqs)
         block_tables = [
             self._block_table(seq) + [-1] * (max_len - len(self._block_table(seq)))
@@ -216,12 +225,13 @@ class ModelRunner:
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
+        cu_seqlens_q = [0]  # prefix array of sequence lengths without num_cached_tokens
+        cu_seqlens_k = [0]  # prefix array of sequence lengths
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+
         for seq in seqs:
             block_table = self._block_table(seq)
             seqlen = len(seq)
@@ -242,23 +252,30 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
+
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
+
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
+
         cu_seqlens_q = torch.tensor(
             cu_seqlens_q, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+
         cu_seqlens_k = torch.tensor(
             cu_seqlens_k, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+
         slot_mapping = torch.tensor(
             slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+
         set_context(
             True,
             cu_seqlens_q,
@@ -272,21 +289,21 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
+        input_ids = []  # list of single query tokens for this batch
+        positions = []  # positions of those tensors in the sequence are needed for rope
         slot_mapping = []
-        context_lens = []
+        context_lens = []  # the total length of each sequence
         for seq in seqs:
             block_table = self._block_table(seq)
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            input_ids.append(seq.last_token)  # last token is the query token
+            positions.append(len(seq) - 1)  # index of the current last token for RoPE
             context_lens.append(len(seq))
-            slot_mapping.append(
+            slot_mapping.append(  # where to store the K/V of the query token
                 block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
-        )
+        )  # stack query tokens into a tensor
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
@@ -314,6 +331,18 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return temperatures
 
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        input_ids, positions = (
+            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        )
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, is_prefill)
+        token_ids = (
+            self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        )
+        reset_context()
+        return token_ids
+
     @torch.inference_mode()
     def run_model(
         self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool
@@ -336,18 +365,6 @@ class ModelRunner:
             ] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
-
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = (
-            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        )
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = (
-            self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        )
-        reset_context()
-        return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):

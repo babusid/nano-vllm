@@ -19,7 +19,7 @@ class LLMEngine:
     def __init__(
         self,
         model_config: Config,
-        speculation_mode: SpeculationMode | None = None,
+        speculation_mode: SpeculationMode = SpeculationMode.NONE,
         speculator_config: list[Config] | None = None,
         speculation_length: int | None = None,
         **kwargs,
@@ -30,14 +30,17 @@ class LLMEngine:
         self.speculation_length = speculation_length
         # tensor parallelism bookkeeping
         # disable TP with specdecode for now
-        if speculation_mode is not None and model_config.tensor_parallel_size > 1:
+        if (
+            speculation_mode is not SpeculationMode.NONE
+            and model_config.tensor_parallel_size > 1
+        ):
             raise NotImplementedError("Speculation not supported with TP")
 
-        if speculation_mode is not None and speculator_config is None:
+        if speculation_mode is not SpeculationMode.NONE and speculator_config is None:
             raise ValueError(
                 "Speculator config and model is required for naive speculation"
             )
-        if speculation_length is not None and (
+        if speculation_mode is not SpeculationMode.NONE and (
             speculation_length is None or speculation_length < 1
         ):
             raise ValueError(
@@ -147,11 +150,11 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         # TODO: gate behavior base don speculation mode
         if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
-            all_token_ids = []
-            for mr in self.model_runners:
-                token_ids = mr.call("run", seqs, is_prefill)
-                all_token_ids.append(token_ids)
-            token_ids = all_token_ids[0]  # TODO: temporary
+            verifier = self.model_runners[0]
+            drafter = self.model_runners[1]
+            draft_ids = drafter.call("run", seqs, is_prefill)
+            verified_ids = verifier.call("run", seqs, is_prefill)
+            token_ids = verified_ids
         else:
             token_ids = self.model_runners[0].call("run", seqs, is_prefill)
 

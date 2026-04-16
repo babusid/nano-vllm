@@ -26,16 +26,23 @@ class Sequence:
         sampling_params=SamplingParams(),
         num_block_tables: int = 1,
     ):
-        self.seq_id = next(Sequence.counter)  # uniquely identify this sequence
-        self.status = SequenceStatus.WAITING  # start off as waiting until scheduled
-        self.token_ids = copy(token_ids)  # if we're given token_ids, copy them in
+        # uniquely identify this sequence
+        self.seq_id = next(Sequence.counter)
+
+        # start off as waiting until scheduled
+        self.status = SequenceStatus.WAITING
+
+        # if we're given token_ids, copy them in
+        self.token_ids = copy(token_ids)
+
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self._block_tables = [
-            [] for _ in range(num_block_tables)
-        ]  # no block memory allocated yet for this sequence
+
+        # no block memory allocated yet for this sequence
+        self._block_tables = [[] for _ in range(num_block_tables)]
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos

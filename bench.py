@@ -20,23 +20,24 @@ def main():
         os.environ.get("MAIN_MODEL_PATH")
         or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-8B/")
     )
-    print("Main Model Path: ", main_model_path)
     main_model_config = Config(
         model=main_model_path,
         max_model_len=4096,
         enforce_eager=False,
         gpu_memory_utilization=0.8,
     )
+    print("Main Model Path: ", main_model_path)
+
     small_model_path = os.path.expanduser(
         os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
     )
-    print("Small Model Path: ", small_model_path)
     small_model_config = Config(
         model=small_model_path,
         max_model_len=4096,
         enforce_eager=False,
         gpu_memory_utilization=0.5,
     )
+    print("Small Model Path: ", small_model_path)
 
     llm = LLM(
         model_config=main_model_config,
