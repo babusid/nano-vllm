@@ -118,31 +118,26 @@ class BlockManager:
         needed_cur_blocks = ceil(cur_len / self.block_size)
         allocated_blocks = len(block_table)
 
-        if cur_len % self.block_size == 0:
-            # Current block became full; finalize/hash that block.
-            assert allocated_blocks >= needed_cur_blocks
-            cur_block_idx = needed_cur_blocks - 1
-            cur_block = self.blocks[block_table[cur_block_idx]]
-            assert cur_block.hash == -1
-            token_ids = seq.block(cur_block_idx)
+        # Finalize all fully filled blocks that are still unhashed.
+        # This is robust to multi-token extension per step (spec decode).
+        num_full_blocks = cur_len // self.block_size
+        for block_idx in range(num_full_blocks):
+            assert allocated_blocks >= (block_idx + 1)
+            block = self.blocks[block_table[block_idx]]
+            if block.hash != -1:
+                continue
+            token_ids = seq.block(block_idx)
             prefix = (
-                self.blocks[block_table[cur_block_idx - 1]].hash
-                if cur_block_idx > 0
-                else -1
+                self.blocks[block_table[block_idx - 1]].hash if block_idx > 0 else -1
             )
+            if block_idx > 0:
+                assert prefix != -1
             h = self.compute_hash(token_ids, prefix)
-            cur_block.update(h, token_ids)
-            self.hash_to_block_id[h] = cur_block.block_id
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block.block_id
 
-        elif cur_len % self.block_size == 1:
-            # First token of a block: previous block must already be finalized.
-            prev_block_idx = needed_cur_blocks - 2
-            if prev_block_idx >= 0:
-                assert allocated_blocks >= (prev_block_idx + 1)
-                prev_block = self.blocks[block_table[prev_block_idx]]
-                assert prev_block.hash != -1
-        else:
-            # Mid-block: current block should be writable/unhashed.
+        # If current length ends inside a block, it must remain writable/unhashed.
+        if cur_len % self.block_size != 0:
             assert allocated_blocks >= needed_cur_blocks
             cur_block_idx = needed_cur_blocks - 1
             cur_block = self.blocks[block_table[cur_block_idx]]
