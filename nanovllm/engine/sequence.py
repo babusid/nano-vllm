@@ -33,7 +33,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.block_tables = [
+        self._block_tables = [
             [] for _ in range(num_block_tables)
         ]  # no block memory allocated yet for this sequence
         self.temperature = sampling_params.temperature
@@ -41,12 +41,20 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
 
     @property
+    def block_tables(self) -> list[list[int]]:
+        return self._block_tables
+
+    @block_tables.setter
+    def block_tables(self, value: list[list[int]]):
+        self._block_tables = value
+
+    @property
     def block_table(self):
-        return self.block_tables[0]
+        return self._block_tables[0]
 
     @block_table.setter
     def block_table(self, value):
-        self.block_tables[0] = value
+        self._block_tables[0] = value
 
     def __len__(self):
         return self.num_tokens
@@ -102,7 +110,7 @@ class Sequence:
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
-            self.block_tables,
+            self._block_tables,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token,
         )
 
@@ -114,9 +122,9 @@ class Sequence:
             block_tables,
         ) = state[:-1]
         if block_tables and isinstance(block_tables[0], int):
-            self.block_tables = [block_tables]
+            self._block_tables = [block_tables]
         else:
-            self.block_tables = block_tables
+            self._block_tables = block_tables
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

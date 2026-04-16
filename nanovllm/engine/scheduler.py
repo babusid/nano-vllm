@@ -13,13 +13,26 @@ class Scheduler:
         block_managers: list[BlockManager],
         speculation_mode: SpeculationMode | None = None,
         speculator_config: list[Config] | None = None,
+        speculation_length: int | None = None,
     ):
         self.speculation_mode = speculation_mode
         self.speculator_config = speculator_config
+        self.speculation_length = speculation_length
+        _spec_conf = [
+            self.speculation_mode,
+            self.speculator_config,
+            self.speculation_length,
+        ]
+        if any(_spec_conf) and not all(_spec_conf):
+            raise ValueError(
+                "Speculation mode, speculator config and speculation length must be specified together"
+            )
+
         self.max_num_seqs = config.max_num_seqs  # batch size in sequences
         self.max_num_batched_tokens = (
             config.max_num_batched_tokens
         )  # batch size in tokens
+        self.max_model_len = config.max_model_len
         self.eos = config.eos  # end of sequence token id
         self.block_managers = block_managers  # setup the memory pools
         self.waiting: deque[Sequence] = deque()  # manage waiting and running sequences
@@ -34,14 +47,15 @@ class Scheduler:
         for block_manager in self.block_managers:
             block_manager.allocate(seq)
 
-    def _can_append(self, seq: Sequence) -> bool:
+    def _can_append(self, seq: Sequence, num_bonus_tokens: int = 0) -> bool:
         return all(
-            block_manager.can_append(seq) for block_manager in self.block_managers
+            block_manager.can_append(seq, num_bonus_tokens)
+            for block_manager in self.block_managers
         )
 
-    def _may_append(self, seq: Sequence):
+    def _may_append(self, seq: Sequence, num_bonus_tokens: int = 0):
         for block_manager in self.block_managers:
-            block_manager.may_append(seq)
+            block_manager.may_append(seq, num_bonus_tokens)
 
     def _deallocate(self, seq: Sequence):
         for block_manager in self.block_managers:
@@ -88,9 +102,17 @@ class Scheduler:
         # decode
         # we didn't have any sequences that were waiting to be scheduled AND could be scheduled
         # so now we're going to try to schedule sequences that are currently running (greedy prefill)
+        speculation_tokens = 0
+        if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            speculation_tokens = self.speculation_length
+
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
-            while not self._can_append(seq):
+            bonus_tokens = min(  # make sure the bonus tokens aren't more than the remaining context
+                speculation_tokens,
+                max(0, self.max_model_len - len(seq)),
+            )
+            while not self._can_append(seq, bonus_tokens):
                 # while we can't append the head of the queue to the batch
                 if self.running:
                     # while we have other sequences that are currently marked as running (were scheduled before)
@@ -107,7 +129,7 @@ class Scheduler:
                 # while loop passed meaning that we can fit the current sequence now
                 # if the else triggered, we don't get here
                 num_seqs += 1
-                self._may_append(seq)
+                self._may_append(seq, bonus_tokens)
                 scheduled_seqs.append(seq)
 
         assert scheduled_seqs  # make sure something got scheduled

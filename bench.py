@@ -42,6 +42,7 @@ def main():
         model_config=main_model_config,
         speculation_mode=SpeculationMode.NAIVE_SPECULATION,
         speculator_config=[small_model_config],
+        speculation_length=8,
     )
 
     prompt_token_ids = [

@@ -1,4 +1,5 @@
 from collections import deque
+from math import ceil
 import xxhash
 import numpy as np
 
@@ -6,7 +7,6 @@ from nanovllm.engine.sequence import Sequence
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
@@ -24,7 +24,6 @@ class Block:
 
 
 class BlockManager:
-
     def __init__(self, num_blocks: int, block_size: int, block_table_idx: int = 0):
         self.block_size = block_size
         self.block_table_idx = block_table_idx
@@ -57,8 +56,8 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+    def can_allocate(self, seq: Sequence, bonus_blocks: int = 0) -> bool:
+        return len(self.free_block_ids) >= (seq.num_blocks + bonus_blocks)
 
     def allocate(self, seq: Sequence):
         block_table = self._block_table(seq)
@@ -102,23 +101,58 @@ class BlockManager:
             seq.num_cached_tokens = 0
         block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
-
-    def may_append(self, seq: Sequence):
+    def can_append(self, seq: Sequence, num_bonus_tokens: int = 0) -> bool:
+        num_tokens_to_reserve = len(seq) + num_bonus_tokens
         block_table = self._block_table(seq)
-        last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+        need_to_allocate = ceil(num_tokens_to_reserve / self.block_size)
+
+        # len block table is how many blocks are already allocated to this
+        # sequence by this block manager
+        num_blocks_to_reserve = need_to_allocate - len(block_table)
+        return len(self.free_block_ids) >= num_blocks_to_reserve
+
+    def may_append(self, seq: Sequence, num_bonus_tokens: int = 0):
+        block_table = self._block_table(seq)
+        cur_len = len(seq)
+
+        needed_cur_blocks = ceil(cur_len / self.block_size)
+        allocated_blocks = len(block_table)
+
+        if cur_len % self.block_size == 0:
+            # Current block became full; finalize/hash that block.
+            assert allocated_blocks >= needed_cur_blocks
+            cur_block_idx = needed_cur_blocks - 1
+            cur_block = self.blocks[block_table[cur_block_idx]]
+            assert cur_block.hash == -1
+            token_ids = seq.block(cur_block_idx)
+            prefix = (
+                self.blocks[block_table[cur_block_idx - 1]].hash
+                if cur_block_idx > 0
+                else -1
+            )
+            h = self.compute_hash(token_ids, prefix)
+            cur_block.update(h, token_ids)
+            self.hash_to_block_id[h] = cur_block.block_id
+
+        elif cur_len % self.block_size == 1:
+            # First token of a block: previous block must already be finalized.
+            prev_block_idx = needed_cur_blocks - 2
+            if prev_block_idx >= 0:
+                assert allocated_blocks >= (prev_block_idx + 1)
+                prev_block = self.blocks[block_table[prev_block_idx]]
+                assert prev_block.hash != -1
+        else:
+            # Mid-block: current block should be writable/unhashed.
+            assert allocated_blocks >= needed_cur_blocks
+            cur_block_idx = needed_cur_blocks - 1
+            cur_block = self.blocks[block_table[cur_block_idx]]
+            assert cur_block.hash == -1
+
+        num_tokens_to_reserve = cur_len + num_bonus_tokens
+        need_to_allocate = ceil(num_tokens_to_reserve / self.block_size)
+        num_blocks_to_reserve = need_to_allocate - len(block_table)
+
+        for _ in range(num_blocks_to_reserve):
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks - 1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        else:
-            assert last_block.hash == -1

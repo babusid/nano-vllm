@@ -21,11 +21,13 @@ class LLMEngine:
         model_config: Config,
         speculation_mode: SpeculationMode | None = None,
         speculator_config: list[Config] | None = None,
+        speculation_length: int | None = None,
         **kwargs,
     ):
         self.speculation_mode = speculation_mode
         self.model_config = model_config
         self.speculator_config = speculator_config
+        self.speculation_length = speculation_length
         # tensor parallelism bookkeeping
         # disable TP with specdecode for now
         if speculation_mode is not None and model_config.tensor_parallel_size > 1:
@@ -34,6 +36,12 @@ class LLMEngine:
         if speculation_mode is not None and speculator_config is None:
             raise ValueError(
                 "Speculator config and model is required for naive speculation"
+            )
+        if speculation_length is not None and (
+            speculation_length is None or speculation_length < 1
+        ):
+            raise ValueError(
+                "Speculation length must be a positive integer for speculation"
             )
 
         self.block_managers: list[BlockManager] = []
@@ -111,8 +119,9 @@ class LLMEngine:
         self.scheduler = Scheduler(
             config=model_config,
             block_managers=self.block_managers,
-            speculation_mode=speculation_mode,
-            speculator_config=speculator_config,
+            speculation_mode=self.speculation_mode,
+            speculator_config=self.speculator_config,
+            speculation_length=self.speculation_length,
         )
 
         # register cleanup hook for tp processes
