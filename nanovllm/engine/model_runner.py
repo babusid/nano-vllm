@@ -33,11 +33,12 @@ class ModelRunner:
         rank: int,
         event: Event | list[Event],
         block_managers: list[BlockManager] | None = None,
-        block_table_idx: int = 0,
+        model_runner_idx: int = 0,
     ):
         self.config = config
         self.block_managers = block_managers if block_managers is not None else []
-        self.block_table_idx = block_table_idx
+        self.block_table_idx = model_runner_idx
+        self.model_runner_idx = model_runner_idx
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -295,12 +296,26 @@ class ModelRunner:
         context_lens = []  # the total length of each sequence
         for seq in seqs:
             block_table = self._block_table(seq)
-            input_ids.append(seq.last_token)  # last token is the query token
-            positions.append(len(seq) - 1)  # index of the current last token for RoPE
-            context_lens.append(len(seq))
-            slot_mapping.append(  # where to store the K/V of the query token
-                block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            draft_token_list = seq.draft_token_ids[self.model_runner_idx]
+            # token idx is the committed tokens + the draft tokens from this model runner
+            token_idx = len(seq) + len(draft_token_list) - 1
+            # last committed token is the query token
+            # if there are no draft tokens
+            input_ids.append(
+                seq.last_token if len(draft_token_list) == 0 else draft_token_list[-1]
             )
+
+            positions.append(token_idx)  # index of the current last token for RoPE
+            context_lens.append(len(seq) + len(draft_token_list))
+            block_idx = token_idx // self.block_size
+            assert block_idx < len(
+                block_table
+            )  # if reservation worked this shouldn't fire
+            block_offset = token_idx % self.block_size
+            slot_mapping.append(  # where to store the K/V of the query token
+                block_table[block_idx] * self.block_size + block_offset
+            )
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )  # stack query tokens into a tensor
