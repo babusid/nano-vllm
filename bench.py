@@ -9,7 +9,7 @@ from nanovllm.engine.llm_engine import SpeculationMode
 # from vllm import LLM, SamplingParams
 
 
-def main():
+def bench():
     seed(0)
     num_seqs = 256
     max_input_len = 1024
@@ -39,6 +39,7 @@ def main():
     )
     print("Small Model Path: ", small_model_path)
 
+    print("Initializing LLM...")
     llm = LLM(
         model_config=main_model_config,
         speculation_mode=SpeculationMode.NAIVE_SPECULATION,
@@ -46,6 +47,7 @@ def main():
         speculation_length=8,
     )
 
+    print("Generating prompts...")
     prompt_token_ids = [
         [randint(0, 10000) for _ in range(randint(100, max_input_len))]
         for _ in range(num_seqs)
@@ -60,12 +62,15 @@ def main():
     # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     # Warmup pass so kernel compilation/setup does not pollute benchmark timing.
+    print("Warmup")
     warmup_n = min(32, num_seqs)
     llm.generate(
         prompt_token_ids[:warmup_n], sampling_params[:warmup_n], use_tqdm=False
     )
     torch.cuda.synchronize()
+    print("Warmup done")
 
+    print("Staring benchmark")
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params, use_tqdm=True)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
@@ -75,7 +80,8 @@ def main():
     print(
         f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s"
     )
+    print("Benchmark done")
 
 
 if __name__ == "__main__":
-    main()
+    bench()

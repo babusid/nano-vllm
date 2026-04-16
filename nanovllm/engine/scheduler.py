@@ -11,7 +11,7 @@ class Scheduler:
         self,
         config: Config,
         block_managers: list[BlockManager],
-        speculation_mode: SpeculationMode | None = None,
+        speculation_mode: SpeculationMode = SpeculationMode.NONE,
         speculator_config: list[Config] | None = None,
         speculation_length: int | None = None,
     ):
@@ -19,7 +19,7 @@ class Scheduler:
         self.speculator_config = speculator_config
         self.speculation_length = speculation_length
         _spec_conf = [
-            self.speculation_mode,
+            self.speculation_mode is not SpeculationMode.NONE,
             self.speculator_config,
             self.speculation_length,
         ]

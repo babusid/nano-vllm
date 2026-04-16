@@ -6,11 +6,11 @@ from nanovllm.engine.llm_engine import SpeculationMode
 from nanovllm.config import Config
 
 
-def main():
-    path = os.path.expanduser(
+def example():
+    example = os.path.expanduser(
         os.environ.get("MAIN_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
     )
-    tokenizer = AutoTokenizer.from_pretrained(path)
+    tokenizer = AutoTokenizer.from_pretrained(example)
 
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
@@ -38,8 +38,6 @@ def main():
 
     llm = LLM(
         model_config=main_model_config,
-        speculation_mode=SpeculationMode.NONE,
-        speculator_config=[small_model_config],
     )
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256)
@@ -72,4 +70,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    example()

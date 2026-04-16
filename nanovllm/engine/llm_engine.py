@@ -182,6 +182,8 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
+        prefill_throughputs = []
+        decode_throughputs = []
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
@@ -192,6 +194,8 @@ class LLMEngine:
                 else:
                     prefill_throughput = 0
                     decode_throughput = -num_tokens / (perf_counter() - t)
+                prefill_throughputs.append(prefill_throughput)
+                decode_throughputs.append(decode_throughput)
                 pbar.set_postfix(
                     {
                         "Prefill": f"{int(prefill_throughput)}tok/s",
@@ -209,4 +213,6 @@ class LLMEngine:
         ]
         if use_tqdm:
             pbar.close()
+        for idx, (pref, dec) in enumerate(zip(prefill_throughputs, decode_throughputs)):
+            print(f"Step {idx}: Prefill {pref:.2f}tok/s, Decode {dec:.2f}tok/s\n")
         return outputs

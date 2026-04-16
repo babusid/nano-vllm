@@ -21,7 +21,6 @@ Usage:
 from __future__ import annotations
 
 import sys
-
 import modal
 
 app = modal.App("nano-vllm-runner")
@@ -84,27 +83,28 @@ def run_target(
     main_revision: str = "",
     spec_model: str = "",
     spec_revision: str = "",
-) -> tuple[int, str, str]:
+) -> None:
     import os
-    import subprocess
+    import runpy
+    import sys
 
     if target not in {"bench", "example"}:
         raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
     print("Target: ", target)
-    env = os.environ.copy()
     main_repo = main_model or "Qwen/Qwen3-8B"
     spec_repo = spec_model or "Qwen/Qwen3-0.6B"
-    env["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
-    env["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
+    os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
 
-    result = subprocess.run(
-        ["python", f"/workspace/{target}.py"],
-        cwd="/workspace",
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode, result.stdout, result.stderr
+    workspace_dir = "/workspace"
+    if workspace_dir not in sys.path:
+        sys.path.insert(0, workspace_dir)
+
+    script_path = os.path.join(workspace_dir, f"{target}.py")
+    if not os.path.isfile(script_path):
+        script_path = f"/{target}.py"
+
+    runpy.run_path(script_path, run_name="__main__")
 
 
 @app.local_entrypoint()
@@ -116,7 +116,7 @@ def main(
     spec_revision: str = "",
 ):
     try:
-        returncode, stdout, stderr = run_target.remote(
+        run_target.remote(
             target,
             main_model,
             main_revision,
@@ -126,12 +126,3 @@ def main(
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")
         sys.exit(1)
-
-    if stdout:
-        print(stdout, end="")
-    if stderr:
-        print(stderr, file=sys.stderr, end="")
-
-    if returncode != 0:
-        print(f"\n{target}.py failed with exit code {returncode}", file=sys.stderr)
-        sys.exit(returncode)
