@@ -104,7 +104,9 @@ class Scheduler:
         # so now we're going to try to schedule sequences that are currently running (greedy prefill)
         speculation_tokens = 0
         if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
-            speculation_tokens = self.speculation_length
+            # add 1 to the speculation length to account for the bonus token
+            # from the verifier
+            speculation_tokens = self.speculation_length + 1
 
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
@@ -148,17 +150,20 @@ class Scheduler:
         self._deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(
+        self, seqs: list[Sequence], seqs_token_ids: list[list[int]]
+    ) -> list[bool]:
         """
         Postprocesses the sequences by adding the generated tokens to the sequence.
         If the generated token is an EOS, the sequence is marked as finished,
         it's remvoed from the waiting list, and its KV cache is deallocated.
         """
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
+        for seq, token_ids in zip(seqs, seqs_token_ids):
+            seq.extend(token_ids)
             if (
-                not seq.ignore_eos and token_id == self.eos
-            ) or seq.num_completion_tokens == seq.max_tokens:
+                not seq.ignore_eos
+                and any(token_id == self.eos for token_id in token_ids)
+            ) or seq.num_completion_tokens >= seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self._deallocate(seq)
                 self.running.remove(seq)

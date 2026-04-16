@@ -40,6 +40,7 @@ class Sequence:
         # and will be empty the whole time. This specific initialization
         # is relied in the model runner.
         self.draft_token_ids = [[] for _ in range(num_block_tables)]
+        self.draft_token_logits = [[] for _ in range(num_block_tables)]
 
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
@@ -118,6 +119,13 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def extend(self, token_ids: list[int]):
+        if not token_ids:
+            return
+        self.token_ids.extend(token_ids)
+        self.last_token = token_ids[-1]
+        self.num_tokens += len(token_ids)
+
     def __getstate__(self):
         return (
             self.num_tokens,
@@ -125,12 +133,23 @@ class Sequence:
             self.num_cached_tokens,
             self._block_tables,
             self.draft_token_ids,
+            self.draft_token_logits,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token,
         )
 
     def __setstate__(self, state):
         draft_token_ids = None
-        if len(state) == 6:
+        draft_token_logits = None
+        if len(state) == 7:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                block_tables,
+                draft_token_ids,
+                draft_token_logits,
+            ) = state[:-1]
+        elif len(state) == 6:
             (
                 self.num_tokens,
                 self.num_prompt_tokens,
@@ -155,6 +174,10 @@ class Sequence:
             self.draft_token_ids = [draft_token_ids]
         else:
             self.draft_token_ids = draft_token_ids
+        if draft_token_logits is None:
+            self.draft_token_logits = [[] for _ in range(len(self._block_tables))]
+        else:
+            self.draft_token_logits = draft_token_logits
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
             self.last_token = self.token_ids[-1]
