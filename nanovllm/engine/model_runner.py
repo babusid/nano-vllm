@@ -223,6 +223,82 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return block_tables
 
+    def prepare_verify(self, seqs: list[Sequence], draft_model_idx: int = 0):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]  # prefix array of sequence lengths without num_cached_tokens
+        cu_seqlens_k = [0]  # prefix array of sequence lengths
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        block_tables = None
+
+        for seq in seqs:
+            block_table = self._block_table(seq)
+            committed_len = len(seq)
+            draft_token_list = seq.draft_token_ids[draft_model_idx]
+            seqlen_q = len(draft_token_list) + 1 if draft_token_list else 0
+            seqlen_k = committed_len + len(draft_token_list) if seqlen_q > 0 else 0
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            if not draft_token_list:
+                continue
+            input_ids.append(seq.last_token)
+            input_ids.extend(draft_token_list)
+            positions.extend(
+                list(range(committed_len - 1, committed_len + len(draft_token_list)))
+            )
+            if not block_table:  # warmup
+                continue
+            slot_mapping.append(-1)
+            for draft_idx in range(len(draft_token_list)):
+                token_idx = committed_len + draft_idx
+                block_idx = token_idx // self.block_size
+                assert block_idx < len(
+                    block_table
+                )  # if reservation worked this shouldn't fire
+                block_offset = token_idx % self.block_size
+                slot_mapping.append(
+                    block_table[block_idx] * self.block_size + block_offset
+                )
+
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
+            block_tables = self.prepare_block_tables(seqs)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
+            non_blocking=True
+        )
+
+        cu_seqlens_q = torch.tensor(
+            cu_seqlens_q, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        cu_seqlens_k = torch.tensor(
+            cu_seqlens_k, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+        )
+        return input_ids, positions
+
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -356,7 +432,34 @@ class ModelRunner:
             self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         )
         reset_context()
-        return token_ids
+        return token_ids, logits
+
+    def sample(self, logits, temperatures):
+        return self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+
+    def verify(
+        self, seqs: list[Sequence], draft_model_idx: int = 0
+    ) -> tuple[list[list[int]] | None, list[torch.Tensor] | None]:
+        if any(len(seq.draft_token_ids) > 2 for seq in seqs):
+            # 2 because drafter and verifier both have tables
+            raise NotImplementedError("Multi draft verification not supported yet")
+        input_ids, positions = self.prepare_verify(seqs, draft_model_idx)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        logits = self.run_model(input_ids, positions, True)
+        flat_token_ids = self.sample(logits, temperatures)
+        reset_context()
+        dlens = [len(seq.draft_token_ids[draft_model_idx]) for seq in seqs]
+        if self.rank == 0:
+            split_logits = []
+            split_token_ids = []
+            start = 0
+            for dlen in dlens:
+                end = start + (dlen + 1 if dlen > 0 else 0)
+                split_logits.append(logits[start:end])
+                split_token_ids.append(flat_token_ids[start:end])
+                start = end
+            return split_token_ids, split_logits
+        return None, None
 
     @torch.inference_mode()
     def run_model(
