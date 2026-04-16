@@ -183,6 +183,11 @@ class LLMEngine:
                 verif_token_ids, verif_logits = verifier.call(
                     "verify", seqs, drafter_model_idx
                 )
+                # print("Num sequences: ", len(seqs))
+                # print(f"Length of Verifier Logits: {len(verif_logits)}")
+                # print(f"Length of Verifier Token Ids: {len(verif_token_ids)}")
+                # print(f"All Verifier Logits: {verif_logits}")
+                # print(f"All Verifier Token Ids: {verif_token_ids}")
 
                 # accept/reject per sequence
                 token_ids = []
@@ -210,17 +215,24 @@ class LLMEngine:
                         bonus_token = residual.multinomial(1).item()
                         seq_accept.append(bonus_token)
                         break
-                    if len(seq_accept) == len(draft_tokens) and big_token_ids:
-                        seq_accept.append(big_token_ids[-1])
-                    if not seq_accept and draft_tokens:
-                        seq_accept.append(draft_tokens[0])
+                    # if len(seq_accept) == len(draft_tokens) and big_token_ids:
+                    #    seq_accept.append(big_token_ids[-1])
+                    # print(f"Draft tokens: {draft_tokens}")
+                    # print(f"Verifier tokens: {big_token_ids}")
+                    # print(f"Sequence index {idx}")
+                    if not seq_accept:
+                        # print(f"Verifier Logits: {big_logits}")
+                        # print(f"Draft logits: {small_logits}")
+                        assert big_token_ids
+                        seq_accept.append(big_token_ids[0])
+
                     token_ids.append(seq_accept)
 
                 # empty draft token list
                 for seq in seqs:
                     seq.draft_token_ids[1] = []
                     seq.draft_token_logits[1] = []
-
+                # assert False, "Reached end of verifier loop"
         else:
             token_ids, _ = self.model_runners[0].call("run", seqs, is_prefill)
             token_ids = [[tok] for tok in token_ids]
@@ -266,10 +278,10 @@ class LLMEngine:
                         "Decode": f"{int(decode_throughput)}tok/s",
                     }
                 )
-            idx += 1
-            print(
-                f"Step {idx}: Prefill {prefill_throughput:.2f}tok/s, Decode {decode_throughput:.2f}tok/s\n"
-            )
+                idx += 1
+                print(
+                    f"Step {idx}: Prefill {prefill_throughput:.2f}tok/s, Decode {decode_throughput:.2f}tok/s\n"
+                )
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:

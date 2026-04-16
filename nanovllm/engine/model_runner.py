@@ -1,5 +1,7 @@
+from ntpath import expanduser
 import pickle
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -252,7 +254,14 @@ class ModelRunner:
             )
             if not block_table:  # warmup
                 continue
-            slot_mapping.append(-1)
+
+            # slot_mapping.append(-1) this was supposedly causing a bug
+            last_idx = committed_len - 1
+            last_block = block_table[last_idx // self.block_size]
+            slot_mapping.append(
+                last_block * self.block_size + last_idx % self.block_size
+            )
+
             for draft_idx in range(len(draft_token_list)):
                 token_idx = committed_len + draft_idx
                 block_idx = token_idx // self.block_size
@@ -437,6 +446,7 @@ class ModelRunner:
     def sample(self, logits, temperatures):
         return self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
 
+    @torch.inference_mode()
     def verify(
         self, seqs: list[Sequence], draft_model_idx: int = 0
     ) -> tuple[list[list[int]] | None, list[torch.Tensor] | None]:
@@ -444,12 +454,23 @@ class ModelRunner:
             # 2 because drafter and verifier both have tables
             raise NotImplementedError("Multi draft verification not supported yet")
         input_ids, positions = self.prepare_verify(seqs, draft_model_idx)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, True)
-        flat_token_ids = self.sample(logits, temperatures)
+        seq_temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        # We need per-query-token logits for verification. compute_logits() routes
+        # through ParallelLMHead.forward, which keeps only last token per sequence
+        # in prefill mode. So for verify we project hidden states directly.
+        hidden_states = self.model(input_ids, positions)
+        logits = F.linear(hidden_states, self.model.lm_head.weight)
         reset_context()
         dlens = [len(seq.draft_token_ids[draft_model_idx]) for seq in seqs]
         if self.rank == 0:
+            repeats = torch.tensor(
+                [dlen + 1 if dlen > 0 else 0 for dlen in dlens],
+                dtype=torch.int64,
+                device=seq_temperatures.device,
+            )
+            expanded_temperatures = seq_temperatures.repeat_interleave(repeats)
+            assert expanded_temperatures.size(0) == logits.size(0)
+            flat_token_ids = self.sample(logits, expanded_temperatures)
             split_logits = []
             split_token_ids = []
             start = 0
