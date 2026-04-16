@@ -61,7 +61,7 @@ class LLMEngine:
                     "rank": i,
                     "event": event,
                     "block_managers": self.block_managers,
-                    "block_table_idx": 0,
+                    "model_runner_idx": 0,
                 },
             )
             process.start()
@@ -81,7 +81,7 @@ class LLMEngine:
                 rank=0,
                 event=self.events,
                 block_managers=self.block_managers,
-                block_table_idx=0,
+                model_runner_idx=0,
             )
         )
 
@@ -105,7 +105,7 @@ class LLMEngine:
                     rank=0,
                     event=self.events,
                     block_managers=self.block_managers,
-                    block_table_idx=1,
+                    model_runner_idx=1,
                 )
             )
             # idx should be length of current array
@@ -150,11 +150,34 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         # TODO: gate behavior base don speculation mode
         if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            # get the two model runners for regular specdec
             verifier = self.model_runners[0]
             drafter = self.model_runners[1]
-            draft_ids = drafter.call("run", seqs, is_prefill)
-            verified_ids = verifier.call("run", seqs, is_prefill)
-            token_ids = verified_ids
+            if is_prefill:
+                # fill the kv of both models, but ignore the draft token
+                drafter.call("run", seqs, is_prefill)
+                token_ids = verifier.call("run", seqs, is_prefill)
+            else:
+                # generate draft tokens
+                for _ in range(self.speculation_length):
+                    draft_ids = drafter.call("run", seqs, is_prefill)
+                    # add draft tokens to the sequence's draft token ids
+
+                    # TODO: update this so that draft_ids is a list of lists and use extend
+                    # so we don't do the appending in the draft loop
+                    for seq, draft_id in zip(seqs, draft_ids):
+                        seq.draft_token_ids[1].append(draft_id)
+
+                token_ids = verifier.call("run", seqs, is_prefill)
+
+                # TODO: need actual verif / memory reclaim logic here
+                # draft tokens should be passed to the verifier, which will
+                # output the correct tokens, we have to empty the draft token list
+                # and reclaim the memory for the ones that got rejected
+                # empty draft token list
+                for seq in seqs:
+                    seq.draft_token_ids[1] = []
+
         else:
             token_ids = self.model_runners[0].call("run", seqs, is_prefill)
 
