@@ -431,6 +431,7 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return temperatures
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
