@@ -106,7 +106,8 @@ class Scheduler:
         if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             # add 1 to the speculation length to account for the bonus token
             # from the verifier
-            speculation_tokens = self.speculation_length + 1
+            # speculation_tokens = self.speculation_length + 1
+            speculation_tokens = self.speculation_length
 
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
@@ -161,9 +162,13 @@ class Scheduler:
         for seq, token_ids in zip(seqs, seqs_token_ids):
             seq.extend(token_ids)
             if (
-                not seq.ignore_eos
-                and any(token_id == self.eos for token_id in token_ids)
-            ) or seq.num_completion_tokens >= seq.max_tokens:
+                (
+                    not seq.ignore_eos
+                    and any(token_id == self.eos for token_id in token_ids)
+                )
+                or seq.num_completion_tokens >= seq.max_tokens
+                or len(seq) >= self.max_model_len
+            ):
                 seq.status = SequenceStatus.FINISHED
                 self._deallocate(seq)
                 self.running.remove(seq)

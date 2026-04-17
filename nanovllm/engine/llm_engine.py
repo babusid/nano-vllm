@@ -127,6 +127,10 @@ class LLMEngine:
             speculation_length=self.speculation_length,
         )
 
+        # running acceptance stats for naive speculation
+        self.spec_drafts_total = 0
+        self.spec_accepted_total = 0
+
         # register cleanup hook for tp processes
         atexit.register(self.exit)
 
@@ -153,6 +157,7 @@ class LLMEngine:
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         # TODO: gate behavior base don speculation mode
+        step_drafts = step_accepted = -1
         if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             # get the two model runners for regular specdec
             verifier_model_idx = 0
@@ -183,20 +188,19 @@ class LLMEngine:
                 verif_token_ids, verif_logits = verifier.call(
                     "verify", seqs, drafter_model_idx
                 )
-                # print("Num sequences: ", len(seqs))
-                # print(f"Length of Verifier Logits: {len(verif_logits)}")
-                # print(f"Length of Verifier Token Ids: {len(verif_token_ids)}")
-                # print(f"All Verifier Logits: {verif_logits}")
-                # print(f"All Verifier Token Ids: {verif_token_ids}")
 
                 # accept/reject per sequence
                 token_ids = []
+                step_drafts = 0
+                step_accepted = 0
                 for idx, seq in enumerate(seqs):
                     draft_tokens = seq.draft_token_ids[drafter_model_idx]
                     small_logits = seq.draft_token_logits[drafter_model_idx]
                     big_token_ids = verif_token_ids[idx]
                     big_logits = verif_logits[idx][:-1]
                     seq_accept = []
+                    step_drafts += len(draft_tokens)
+                    seq_accepted_drafts = 0
                     for tok, small, bin in zip(draft_tokens, small_logits, big_logits):
                         small_prob_dist = small.softmax(dim=-1)
                         big_prob_dist = bin.softmax(dim=-1)
@@ -209,20 +213,15 @@ class LLMEngine:
                             )
                         if accept:
                             seq_accept.append(tok)
+                            seq_accepted_drafts += 1
                             continue
                         residual = (big_prob_dist - small_prob_dist).clamp_min(0)
                         residual = residual / (residual.sum() + 1e-12)
                         bonus_token = residual.multinomial(1).item()
                         seq_accept.append(bonus_token)
                         break
-                    # if len(seq_accept) == len(draft_tokens) and big_token_ids:
-                    #    seq_accept.append(big_token_ids[-1])
-                    # print(f"Draft tokens: {draft_tokens}")
-                    # print(f"Verifier tokens: {big_token_ids}")
-                    # print(f"Sequence index {idx}")
+                    step_accepted += seq_accepted_drafts
                     if not seq_accept:
-                        # print(f"Verifier Logits: {big_logits}")
-                        # print(f"Draft logits: {small_logits}")
                         assert big_token_ids
                         seq_accept.append(big_token_ids[0])
 
@@ -232,7 +231,6 @@ class LLMEngine:
                 for seq in seqs:
                     seq.draft_token_ids[1] = []
                     seq.draft_token_logits[1] = []
-                # assert False, "Reached end of verifier loop"
         else:
             token_ids, _ = self.model_runners[0].call("run", seqs, is_prefill)
             token_ids = [[tok] for tok in token_ids]
@@ -242,7 +240,12 @@ class LLMEngine:
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+        # step_drafts/step_accepted are -1 for prefill and non-spec steps so
+        # callers can distinguish "no spec this step" from a genuine 0-draft
+        # batch. Caller aggregates; see generate() / bench for reporting.
+        # TODO: richer metrics — per-step distribution of accepted-run
+        # lengths, time spent in drafter vs verifier, etc.
+        return outputs, num_tokens, step_drafts, step_accepted
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -264,7 +267,12 @@ class LLMEngine:
         idx = 0
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, num_tokens, step_drafts, step_accepted = self.step()
+            # accumulate spec metrics regardless of use_tqdm — caller dumps
+            # aggregates (see bench.py). -1 sentinel = prefill or non-spec.
+            if step_drafts > 0:
+                self.spec_drafts_total += step_drafts
+                self.spec_accepted_total += step_accepted
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)

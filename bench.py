@@ -6,8 +6,6 @@ import torch
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.llm_engine import SpeculationMode
 
-# from vllm import LLM, SamplingParams
-
 
 def bench():
     seed(0)
@@ -18,12 +16,12 @@ def bench():
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
         os.environ.get("MAIN_MODEL_PATH")
-        or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-8B/")
+        or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
     )
     main_model_config = Config(
         model=main_model_path,
         max_model_len=4096,
-        enforce_eager=False,
+        enforce_eager=True,
         gpu_memory_utilization=0.8,
     )
     print("Main Model Path: ", main_model_path)
@@ -34,7 +32,7 @@ def bench():
     small_model_config = Config(
         model=small_model_path,
         max_model_len=4096,
-        enforce_eager=False,
+        enforce_eager=True,
         gpu_memory_utilization=0.5,
     )
     print("Small Model Path: ", small_model_path)
@@ -58,8 +56,6 @@ def bench():
         )
         for _ in range(num_seqs)
     ]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     # Warmup pass so kernel compilation/setup does not pollute benchmark timing.
     print("Warmup")
@@ -71,6 +67,9 @@ def bench():
     print("Warmup done")
 
     print("Staring benchmark")
+    # snapshot spec counters so warmup's drafts don't leak into the benchmark
+    drafts_before = llm.spec_drafts_total
+    accepted_before = llm.spec_accepted_total
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params, use_tqdm=True)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
@@ -80,6 +79,14 @@ def bench():
     print(
         f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s"
     )
+    drafts = llm.spec_drafts_total - drafts_before
+    accepted = llm.spec_accepted_total - accepted_before
+    if drafts:
+        rate = accepted / drafts
+        print(
+            f"Spec: drafted={drafts}tok, accepted={accepted}tok, "
+            f"acceptance={rate:.2%}"
+        )
     print("Benchmark done")
 
 

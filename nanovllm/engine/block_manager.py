@@ -113,16 +113,27 @@ class BlockManager:
 
     def may_append(self, seq: Sequence, num_bonus_tokens: int = 0):
         block_table = self._block_table(seq)
-        cur_len = len(seq)
+        committed_len = len(seq)
+        cur_len = committed_len + num_bonus_tokens
 
-        needed_cur_blocks = ceil(cur_len / self.block_size)
-        allocated_blocks = len(block_table)
+        # Grow the block table to cover committed + bonus (reserved) slots.
+        # With spec decode, up to num_bonus_tokens new tokens may be committed
+        # per step, so the previous reservation can fall short by one or more
+        # blocks — may_append is responsible for allocating them now.
+        need_to_allocate = ceil(cur_len / self.block_size) if cur_len else 0
+        num_blocks_to_reserve = need_to_allocate - len(block_table)
+        for _ in range(num_blocks_to_reserve):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_table.append(block_id)
 
         # Finalize all fully filled blocks that are still unhashed.
         # This is robust to multi-token extension per step (spec decode).
-        num_full_blocks = cur_len // self.block_size
+        # Only blocks whose contents are fully committed may be hashed —
+        # speculative slots haven't been accepted yet, and a hashed block
+        # is treated as immutable by the prefix cache.
+        num_full_blocks = committed_len // self.block_size
         for block_idx in range(num_full_blocks):
-            assert allocated_blocks >= (block_idx + 1)
             block = self.blocks[block_table[block_idx]]
             if block.hash != -1:
                 continue
@@ -138,16 +149,6 @@ class BlockManager:
 
         # If current length ends inside a block, it must remain writable/unhashed.
         if cur_len % self.block_size != 0:
-            assert allocated_blocks >= needed_cur_blocks
-            cur_block_idx = needed_cur_blocks - 1
+            cur_block_idx = need_to_allocate - 1
             cur_block = self.blocks[block_table[cur_block_idx]]
             assert cur_block.hash == -1
-
-        num_tokens_to_reserve = cur_len + num_bonus_tokens
-        need_to_allocate = ceil(num_tokens_to_reserve / self.block_size)
-        num_blocks_to_reserve = need_to_allocate - len(block_table)
-
-        for _ in range(num_blocks_to_reserve):
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)

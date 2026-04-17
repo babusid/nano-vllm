@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class SamplingParams:
-    temperature: float = 1.0
+    temperature: float = 1e-9
     max_tokens: int = 64
     ignore_eos: bool = False
 
