@@ -65,6 +65,7 @@ hf_volume = modal.Volume.from_name("nano-vllm-hf-cache", create_if_missing=True)
 trace_volume = modal.Volume.from_name(
     "nano-vllm-profiler-traces", create_if_missing=True
 )
+sharegpt_volume = modal.Volume.from_name("nano-vllm-sharegpt", create_if_missing=True)
 TRACE_DIR = Path("/traces")
 
 image = (
@@ -94,6 +95,14 @@ image = (
 )
 
 
+SHAREGPT_URL = (
+    "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered"
+    "/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+)
+SHAREGPT_DIR = "/sharegpt"
+SHAREGPT_PATH = "/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+
 def _download_model(repo_id: str, revision: str = "", enable_cache: bool = True) -> str:
     import os
     from huggingface_hub import snapshot_download
@@ -111,11 +120,27 @@ def _download_model(repo_id: str, revision: str = "", enable_cache: bool = True)
     return model_path
 
 
+def _download_sharegpt() -> str:
+    import urllib.request
+
+    if not __import__("os").path.exists(SHAREGPT_PATH):
+        print(f"Downloading ShareGPT dataset to {SHAREGPT_PATH} ...")
+        urllib.request.urlretrieve(SHAREGPT_URL, SHAREGPT_PATH)
+        print("ShareGPT download complete.")
+    else:
+        print("ShareGPT dataset already present, skipping download.")
+    return SHAREGPT_PATH
+
+
 @app.function(
     image=image,
     gpu="B200:1",
     timeout=7200,
-    volumes={"/root/huggingface": hf_volume, str(TRACE_DIR): trace_volume},
+    volumes={
+        "/root/huggingface": hf_volume,
+        str(TRACE_DIR): trace_volume,
+        str(SHAREGPT_DIR): sharegpt_volume,
+    },
 )
 def run_target(
     target: str,
@@ -170,6 +195,8 @@ def run_target(
     os.environ["SPEC_MODE"] = spec_mode_norm
     os.environ["SPEC_LENGTH"] = str(spec_length)
     os.environ["ENFORCE_EAGER"] = "1" if enforce_eager else "0"
+    if target == "bench":
+        os.environ["SHAREGPT_PATH"] = _download_sharegpt()
 
     workspace_dir = "/workspace"
     if workspace_dir not in sys.path:
