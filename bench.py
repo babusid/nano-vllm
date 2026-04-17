@@ -1,19 +1,111 @@
+import argparse
+import json
 import os
+import random
 import time
-from random import randint, seed
 from nanovllm.config import Config
 import torch
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.llm_engine import SpeculationMode
 
-# from vllm import LLM, SamplingParams
+def load_sharegpt_prompts(
+    path: str,
+    tokenizer,
+    num_seqs: int,
+    max_input_len: int,
+    max_output_len: int,
+    seed: int = 0,
+    temperature: float = 0.6,
+) -> tuple[list[str], list[SamplingParams]]:
+
+    with open(path, "r", encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    candidates: list[tuple[str, int]] = []
+    for conversation in dataset:
+        turns = conversation.get("conversations", [])
+
+        human_value = next(
+            (t["value"] for t in turns if t.get("from") == "human"), None
+        )
+        gpt_value = next(
+            (t["value"] for t in turns if t.get("from") == "gpt"), None
+        )
+        if human_value is None or gpt_value is None:
+            continue
+
+        input_ids = tokenizer.encode(human_value)
+        if len(input_ids) > max_input_len:
+            continue
+
+        output_ids = tokenizer.encode(gpt_value)
+        output_len = min(len(output_ids), max_output_len)
+        if output_len == 0:
+            continue
+
+        candidates.append((human_value, output_len))
+
+    if len(candidates) < num_seqs:
+        raise ValueError(
+            f"Only {len(candidates)} valid ShareGPT prompts found after filtering, "
+            f"but num_seqs={num_seqs} requested. "
+            "Try increasing max_input_len / max_output_len or reducing num_seqs."
+        )
+
+    rng = random.Random(seed)
+    selected = rng.sample(candidates, num_seqs)
+
+    prompts = [prompt for prompt, _ in selected]
+    sampling_params = [
+        SamplingParams(temperature=temperature, max_tokens=output_len)
+        for _, output_len in selected
+    ]
+    return prompts, sampling_params
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="nano-vllm ShareGPT benchmark")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="ShareGPT_V3_unfiltered_cleaned_split.json",
+        help="Path to the ShareGPT JSON file.",
+    )
+    parser.add_argument(
+        "--num-seqs",
+        type=int,
+        default=256,
+        help="Number of prompts to benchmark.",
+    )
+    parser.add_argument(
+        "--max-input-len",
+        type=int,
+        default=1024,
+        help="Maximum input token length; longer prompts are discarded.",
+    )
+    parser.add_argument(
+        "--max-output-len",
+        type=int,
+        default=1024,
+        help="Cap on output tokens per request (derived from reference reply length).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for prompt sampling.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.6,
+        help="Sampling temperature.",
+    )
+    return parser.parse_args()
 
 
 def main():
-    seed(0)
-    num_seqs = 256
-    max_input_len = 1024
-    max_ouput_len = 1024
+    args = parse_args()
 
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
@@ -46,31 +138,29 @@ def main():
         speculator_config=[small_model_config],
     )
 
-    prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(100, max_input_len))]
-        for _ in range(num_seqs)
-    ]
-    sampling_params = [
-        SamplingParams(
-            temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)
-        )
-        for _ in range(num_seqs)
-    ]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+    print(f"Loading ShareGPT prompts from {args.dataset} ...")
+    prompts, sampling_params = load_sharegpt_prompts(
+        path=args.dataset,
+        tokenizer=llm.tokenizer,
+        num_seqs=args.num_seqs,
+        max_input_len=args.max_input_len,
+        max_output_len=args.max_output_len,
+        seed=args.seed,
+        temperature=args.temperature,
+    )
+    print(f"Loaded {len(prompts)} prompts.")
 
     # Warmup pass so kernel compilation/setup does not pollute benchmark timing.
-    warmup_n = min(32, num_seqs)
-    llm.generate(
-        prompt_token_ids[:warmup_n], sampling_params[:warmup_n], use_tqdm=False
-    )
+    warmup_n = min(32, args.num_seqs)
+    llm.generate(prompts[:warmup_n], sampling_params[:warmup_n], use_tqdm=False)
     torch.cuda.synchronize()
 
     t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=True)
-    total_tokens = sum(sp.max_tokens for sp in sampling_params)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
     torch.cuda.synchronize()
     t = time.time() - t
+
+    total_tokens = sum(len(out["token_ids"]) for out in outputs)
     throughput = total_tokens / t
     print(
         f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s"

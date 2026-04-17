@@ -55,6 +55,13 @@ image = (
 )
 
 
+SHAREGPT_URL = (
+    "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered"
+    "/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+)
+SHAREGPT_PATH = "/root/ShareGPT_V3_unfiltered_cleaned_split.json"
+
+
 def _download_model(repo_id: str, revision: str = "") -> str:
     from huggingface_hub import snapshot_download
 
@@ -65,6 +72,18 @@ def _download_model(repo_id: str, revision: str = "") -> str:
         download_kwargs["revision"] = revision
     snapshot_download(**download_kwargs)
     return model_path
+
+
+def _download_sharegpt() -> str:
+    import urllib.request
+
+    if not __import__("os").path.exists(SHAREGPT_PATH):
+        print(f"Downloading ShareGPT dataset to {SHAREGPT_PATH} ...")
+        urllib.request.urlretrieve(SHAREGPT_URL, SHAREGPT_PATH)
+        print("ShareGPT download complete.")
+    else:
+        print("ShareGPT dataset already present, skipping download.")
+    return SHAREGPT_PATH
 
 
 @app.function(
@@ -89,16 +108,19 @@ def run_target(
         raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
     print("Target: ", target)
     env = os.environ.copy()
+    cmd = ["python", f"/workspace/{target}.py"]
     if target == "bench":
         main_repo = main_model or "Qwen/Qwen3-8B"
         spec_repo = spec_model or "Qwen/Qwen3-0.6B"
         env["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
         env["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+        dataset_path = _download_sharegpt()
+        cmd += ["--dataset", dataset_path]
     else:
         env["MODEL_PATH"] = _download_model(model, revision)
 
     result = subprocess.run(
-        ["python", f"/workspace/{target}.py"],
+        cmd,
         cwd="/workspace",
         env=env,
         capture_output=True,
