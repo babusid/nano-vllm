@@ -13,7 +13,6 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
     def rms_forward_2d(
         self,
         x: torch.Tensor,
@@ -25,7 +24,6 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
     def rms_forward_3d(
         self,
         x: torch.Tensor,
@@ -37,7 +35,6 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
     def add_rms_forward_2d(
         self,
         x: torch.Tensor,
@@ -51,7 +48,6 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x, residual
 
-    @torch.compile
     def add_rms_forward_3d(
         self,
         x: torch.Tensor,

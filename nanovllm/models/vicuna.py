@@ -6,19 +6,27 @@ from transformers import LlamaConfig
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.linear import (
+    QKVParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from nanovllm.layers.rotary_embedding import RotaryEmbedding, get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class VicunaRMSNorm(RMSNorm):
-    @torch.compile
-    def rms_forward(self, x):
-        return RMSNorm.rms_forward(self, x)
+    def rms_forward_2d(self, x):
+        return RMSNorm.rms_forward_2d(self, x)
 
-    @torch.compile
-    def add_rms_forward(self, x, residual):
-        return RMSNorm.add_rms_forward(self, x, residual)
+    def rms_forward_3d(self, x):
+        return RMSNorm.rms_forward_3d(self, x)
+
+    def add_rms_forward_2d(self, x, residual):
+        return RMSNorm.add_rms_forward_2d(self, x, residual)
+
+    def add_rms_forward_3d(self, x, residual):
+        return RMSNorm.add_rms_forward_3d(self, x, residual)
 
 
 class VicunaSiluAndMul(SiluAndMul):
@@ -58,7 +66,7 @@ class VicunaAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -155,8 +163,12 @@ class VicunaDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
-        self.input_layernorm = VicunaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = VicunaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = VicunaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = VicunaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -181,8 +193,12 @@ class VicunaModel(nn.Module):
         config: LlamaConfig,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([VicunaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size
+        )
+        self.layers = nn.ModuleList(
+            [VicunaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
         self.norm = VicunaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -207,10 +223,7 @@ class VicunaForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(
-        self,
-        config: LlamaConfig
-    ) -> None:
+    def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
         self.model = VicunaModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)

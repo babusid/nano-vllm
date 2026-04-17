@@ -17,18 +17,22 @@ def store_kvcache_kernel(
     v_cache_ptr,
     slot_mapping_ptr,
     D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1:
         return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    offsets = block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = offsets < D
+    key_offsets = idx * key_stride + offsets
+    value_offsets = idx * value_stride + offsets
+    key = tl.load(key_ptr + key_offsets, mask=mask, other=0.0)
+    value = tl.load(value_ptr + value_offsets, mask=mask, other=0.0)
+    cache_offsets = slot * D + offsets
+    tl.store(k_cache_ptr + cache_offsets, key, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value, mask=mask)
 
 
 def store_kvcache(
@@ -44,8 +48,18 @@ def store_kvcache(
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](
-        key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D
+    BLOCK_D = 256
+    grid = (N, triton.cdiv(D, BLOCK_D))
+    store_kvcache_kernel[grid](
+        key,
+        key.stride(0),
+        value,
+        value.stride(0),
+        k_cache,
+        v_cache,
+        slot_mapping,
+        D,
+        BLOCK_D,
     )
 
 
