@@ -13,36 +13,50 @@ def bench():
     max_input_len = 1024
     max_ouput_len = 1024
 
+    # speculation config comes from env so run_modal.py flags can propagate
+    spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
+    spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
+    use_spec = spec_mode_str == "naive"
+    print(f"Spec: mode={spec_mode_str} length={spec_length if use_spec else '-'}")
+
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
         os.environ.get("MAIN_MODEL_PATH")
-        or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
+        or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.8B/")
     )
     main_model_config = Config(
         model=main_model_path,
         max_model_len=4096,
-        enforce_eager=True,
+        enforce_eager=False,
         gpu_memory_utilization=0.8,
     )
     print("Main Model Path: ", main_model_path)
 
-    small_model_path = os.path.expanduser(
-        os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
-    )
-    small_model_config = Config(
-        model=small_model_path,
-        max_model_len=4096,
-        enforce_eager=True,
-        gpu_memory_utilization=0.5,
-    )
-    print("Small Model Path: ", small_model_path)
+    # only construct the speculator config when naive spec is requested —
+    # Config.__post_init__ hits the filesystem / HF cache, so skipping it
+    # lets non-spec runs work without a speculator model present
+    spec_kwargs = {}
+    if use_spec:
+        small_model_path = os.path.expanduser(
+            os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
+        )
+        small_model_config = Config(
+            model=small_model_path,
+            max_model_len=4096,
+            enforce_eager=False,
+            gpu_memory_utilization=0.5,
+        )
+        print("Small Model Path: ", small_model_path)
+        spec_kwargs = dict(
+            speculation_mode=SpeculationMode.NAIVE_SPECULATION,
+            speculator_config=[small_model_config],
+            speculation_length=spec_length,
+        )
 
     print("Initializing LLM...")
     llm = LLM(
         model_config=main_model_config,
-        speculation_mode=SpeculationMode.NAIVE_SPECULATION,
-        speculator_config=[small_model_config],
-        speculation_length=8,
+        **spec_kwargs,
     )
 
     print("Generating prompts...")

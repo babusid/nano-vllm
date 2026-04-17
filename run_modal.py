@@ -5,17 +5,23 @@ Setup (one-time):
     modal setup
 
 Usage:
-    # Run benchmark script (8B main + 0.6B speculator by default)
+    # Run benchmark script (8B main, no speculation by default)
     modal run run_modal.py --target bench
 
     # Run example script (single model)
     modal run run_modal.py --target example
 
+    # Run benchmark with naive speculative decoding (default length 1)
+    modal run run_modal.py --target bench --spec-mode naive
+
+    # Run benchmark with naive speculation, length 8
+    modal run run_modal.py --target bench --spec-mode naive --spec-length 8
+
     # Run benchmark with custom models
     modal run run_modal.py --target bench --main-model "Qwen/Qwen3-8B" --spec-model "Qwen/Qwen3-0.6B"
 
     # Run example with custom model and revision
-    modal run run_modal.py --target example --model "Qwen/Qwen3-0.6B" --revision "main"
+    modal run run_modal.py --target example --main-model "Qwen/Qwen3-0.6B" --main-revision "main"
 """
 
 from __future__ import annotations
@@ -61,7 +67,7 @@ def _download_model(repo_id: str, revision: str = "", enable_cache: bool = True)
     model_name = repo_id.rstrip("/").split("/")[-1]
     model_path = f"/root/huggingface/{model_name}"
     if os.path.isfile(os.path.join(model_path, "config.json")) and enable_cache:
-        print(f"using cached mode: {model_path}")
+        print(f"using cached model: {model_path}")
         return model_path
 
     download_kwargs = {"repo_id": repo_id, "local_dir": model_path}
@@ -83,6 +89,8 @@ def run_target(
     main_revision: str = "",
     spec_model: str = "",
     spec_revision: str = "",
+    spec_mode: str = "none",
+    spec_length: int = 1,
 ) -> None:
     import os
     import runpy
@@ -90,11 +98,26 @@ def run_target(
 
     if target not in {"bench", "example"}:
         raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
+    spec_mode_norm = spec_mode.lower()
+    if spec_mode_norm not in {"none", "naive"}:
+        raise ValueError(
+            f"spec_mode must be one of ['none', 'naive'], got {spec_mode!r}"
+        )
+    if spec_length < 1:
+        raise ValueError(f"spec_length must be >= 1, got {spec_length}")
     print("Target: ", target)
+    print(f"Spec: mode={spec_mode_norm} length={spec_length}")
+
     main_repo = main_model or "Qwen/Qwen3-8B"
-    spec_repo = spec_model or "Qwen/Qwen3-0.6B"
     os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
-    os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    # only pull the speculator when we're actually going to use it
+    if spec_mode_norm != "none":
+        spec_repo = spec_model or "Qwen/Qwen3-0.6B"
+        os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+
+    # propagate spec config to the target script via env
+    os.environ["SPEC_MODE"] = spec_mode_norm
+    os.environ["SPEC_LENGTH"] = str(spec_length)
 
     workspace_dir = "/workspace"
     if workspace_dir not in sys.path:
@@ -114,6 +137,8 @@ def main(
     main_revision: str = "",
     spec_model: str = "Qwen/Qwen3-0.6B",
     spec_revision: str = "",
+    spec_mode: str = "none",
+    spec_length: int = 1,
 ):
     try:
         run_target.remote(
@@ -122,6 +147,8 @@ def main(
             main_revision,
             spec_model,
             spec_revision,
+            spec_mode,
+            spec_length,
         )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")
