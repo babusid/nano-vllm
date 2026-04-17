@@ -197,13 +197,15 @@ class LLMEngine:
                     draft_tokens = seq.draft_token_ids[drafter_model_idx]
                     small_logits = seq.draft_token_logits[drafter_model_idx]
                     big_token_ids = verif_token_ids[idx]
-                    big_logits = verif_logits[idx][:-1]
+                    draft_big_logits = verif_logits[idx][:-1]
                     seq_accept = []
                     step_drafts += len(draft_tokens)
                     seq_accepted_drafts = 0
-                    for tok, small, bin in zip(draft_tokens, small_logits, big_logits):
+                    for tok, small, big in zip(
+                        draft_tokens, small_logits, draft_big_logits
+                    ):
                         small_prob_dist = small.softmax(dim=-1)
-                        big_prob_dist = bin.softmax(dim=-1)
+                        big_prob_dist = big.softmax(dim=-1)
                         p_small = small_prob_dist[tok]
                         p_big = big_prob_dist[tok]
                         accept = p_big >= p_small
@@ -220,6 +222,9 @@ class LLMEngine:
                         bonus_token = residual.multinomial(1).item()
                         seq_accept.append(bonus_token)
                         break
+                    if seq_accepted_drafts == len(draft_tokens) and draft_tokens:
+                        assert len(big_token_ids) == len(draft_tokens) + 1
+                        seq_accept.append(big_token_ids[-1])
                     step_accepted += seq_accepted_drafts
                     if not seq_accept:
                         assert big_token_ids

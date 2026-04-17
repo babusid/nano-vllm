@@ -106,8 +106,8 @@ class Scheduler:
         if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             # add 1 to the speculation length to account for the bonus token
             # from the verifier
-            # speculation_tokens = self.speculation_length + 1
-            speculation_tokens = self.speculation_length
+            speculation_tokens = self.speculation_length + 1
+            # speculation_tokens = self.speculation_length
 
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
