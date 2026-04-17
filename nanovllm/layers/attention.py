@@ -99,9 +99,16 @@ class Attention(nn.Module):
                 causal=True,
                 block_table=context.block_tables,
             )
-        else:  # decode
+        else:  # decode (single-query) or verify (multi-query)
+            # seqlen_q = 1 for regular decode, spec_len+1 for verify.
+            # All seqs in the batch must share the same seqlen_q (enforced by
+            # prepare_decode / prepare_verify) so the (bs, seqlen_q, ...)
+            # reshape is valid and causal=True handles intra-query masking.
+            bs = context.context_lens.size(0)
+            seqlen_q = q.size(0) // bs
+            q_paged = q.view(bs, seqlen_q, self.num_heads, self.head_dim)
             o = flash_attn_with_kvcache(
-                q.unsqueeze(1),
+                q_paged,
                 k_cache,
                 v_cache,
                 cache_seqlens=context.context_lens,
@@ -109,4 +116,5 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
                 causal=True,
             )
+            o = o.view(bs * seqlen_q, self.num_heads, self.head_dim)
         return o

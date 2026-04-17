@@ -76,6 +76,13 @@ class LLMEngine:
         model_config.eos = self.tokenizer.eos_token_id
 
         # setup model runner(s), one for each model instance that we need to run
+        # Tell the verifier how many query tokens per seq to expect during verify
+        # so it can capture a matching family of CUDA graphs.
+        verify_seqlen_q = (
+            speculation_length + 1
+            if speculation_mode is SpeculationMode.NAIVE_SPECULATION
+            else None
+        )
         self.model_runners.append(
             ModelRunner(
                 config=model_config,
@@ -83,6 +90,11 @@ class LLMEngine:
                 event=self.events,
                 block_managers=self.block_managers,
                 model_runner_idx=0,
+                verify_seqlen_q=(
+                    verify_seqlen_q
+                    if speculation_mode is not SpeculationMode.NONE
+                    else None
+                ),
             )
         )
 

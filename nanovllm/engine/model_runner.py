@@ -1,7 +1,6 @@
 from ntpath import expanduser
 import pickle
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -36,11 +35,16 @@ class ModelRunner:
         event: Event | list[Event],
         block_managers: list[BlockManager] | None = None,
         model_runner_idx: int = 0,
+        verify_seqlen_q: int | None = None,
     ):
         self.config = config
         self.block_managers = block_managers if block_managers is not None else []
         self.block_table_idx = model_runner_idx
         self.model_runner_idx = model_runner_idx
+        # When set, capture a second family of CUDA graphs sized for
+        # bs * verify_seqlen_q query tokens so verify() can replay instead of
+        # running eagerly. Only the verifier runner needs this.
+        self.verify_seqlen_q = verify_seqlen_q
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -84,6 +88,8 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+            if self.verify_seqlen_q is not None and self.verify_seqlen_q > 1:
+                self.capture_verify_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -104,6 +110,8 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if hasattr(self, "verify_graphs"):
+                del self.verify_graphs
         torch.cuda.synchronize()
         if self._owns_process_group and dist.is_initialized():
             dist.destroy_process_group()
@@ -226,36 +234,33 @@ class ModelRunner:
         return block_tables
 
     def prepare_verify(self, seqs: list[Sequence], draft_model_idx: int = 0):
+        # Decode-style context: verify is multi-query paged attention
+        # (seqlen_q = spec_len + 1 per seq, all seqs uniform) so it can share
+        # flash_attn_with_kvcache and the decode CUDA graph buffer layout.
         input_ids = []
         positions = []
-        cu_seqlens_q = [0]  # prefix array of sequence lengths without num_cached_tokens
-        cu_seqlens_k = [0]  # prefix array of sequence lengths
-        max_seqlen_q = 0
-        max_seqlen_k = 0
         slot_mapping = []
-        block_tables = None
+        context_lens = []
 
         for seq in seqs:
             block_table = self._block_table(seq)
             committed_len = len(seq)
             draft_token_list = seq.draft_token_ids[draft_model_idx]
-            seqlen_q = len(draft_token_list) + 1 if draft_token_list else 0
-            seqlen_k = committed_len + len(draft_token_list) if seqlen_q > 0 else 0
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not draft_token_list:
+                # seqs with no drafts contribute no query tokens; upstream
+                # split logic will produce an empty slice for them.
+                context_lens.append(0)
                 continue
             input_ids.append(seq.last_token)
             input_ids.extend(draft_token_list)
             positions.extend(
                 list(range(committed_len - 1, committed_len + len(draft_token_list)))
             )
-            if not block_table:  # warmup
+            # cache covers committed tokens + newly-stored draft K/V
+            context_lens.append(committed_len + len(draft_token_list))
+            if not block_table:  # warmup — no cache slots yet
                 continue
 
-            # slot_mapping.append(-1) this was supposedly causing a bug
             last_idx = committed_len - 1
             last_block = block_table[last_idx // self.block_size]
             slot_mapping.append(
@@ -273,38 +278,25 @@ class ModelRunner:
                     block_table[block_idx] * self.block_size + block_offset
                 )
 
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
-
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
-
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
             non_blocking=True
         )
-
-        cu_seqlens_q = torch.tensor(
-            cu_seqlens_q, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
-        cu_seqlens_k = torch.tensor(
-            cu_seqlens_k, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-
         slot_mapping = torch.tensor(
             slot_mapping, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+        context_lens = torch.tensor(
+            context_lens, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
 
         set_context(
-            True,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            slot_mapping,
-            None,
-            block_tables,
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
         )
         return input_ids, positions
 
@@ -456,11 +448,11 @@ class ModelRunner:
             raise NotImplementedError("Multi draft verification not supported yet")
         input_ids, positions = self.prepare_verify(seqs, draft_model_idx)
         seq_temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        # We need per-query-token logits for verification. compute_logits() routes
-        # through ParallelLMHead.forward, which keeps only last token per sequence
-        # in prefill mode. So for verify we project hidden states directly.
-        hidden_states = self.model(input_ids, positions)
-        logits = F.linear(hidden_states, self.model.lm_head.weight)
+        # prepare_verify sets is_prefill=False, so ParallelLMHead keeps every
+        # query-token's logits (no last-token truncation), and run_verify_model
+        # replays a captured graph when possible.
+        hidden_states = self.run_verify_model(input_ids, positions)
+        logits = self.model.compute_logits(hidden_states)
         reset_context()
         dlens = [len(seq.draft_token_ids[draft_model_idx]) for seq in seqs]
         if self.rank == 0:
@@ -482,6 +474,37 @@ class ModelRunner:
                 start = end
             return split_token_ids, split_logits
         return None, None
+
+    @torch.inference_mode()
+    def run_verify_model(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # Mirrors run_model's graph-replay path but sized for multi-query verify
+        # (bs * seqlen_q tokens). Falls back to eager when graphs aren't
+        # available or the batch overflows the captured buffer.
+        if self.enforce_eager or not hasattr(self, "verify_graphs"):
+            return self.model(input_ids, positions)
+        seqlen_q = self.verify_seqlen_q
+        N = input_ids.size(0)
+        assert (
+            N % seqlen_q == 0
+        ), f"verify expects uniform seqlen_q={seqlen_q} per seq, got {N} tokens"
+        bs = N // seqlen_q
+        graph_bs = next((x for x in self.verify_graph_bs if x >= bs), None)
+        if graph_bs is None:
+            return self.model(input_ids, positions)
+        context = get_context()
+        graph = self.verify_graphs[graph_bs]
+        gv = self.verify_graph_vars
+        gv["input_ids"][:N] = input_ids
+        gv["positions"][:N] = positions
+        gv["slot_mapping"].fill_(-1)
+        gv["slot_mapping"][: context.slot_mapping.size(0)] = context.slot_mapping
+        gv["context_lens"].zero_()
+        gv["context_lens"][:bs] = context.context_lens
+        gv["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return gv["outputs"][:N]
 
     @torch.inference_mode()
     def run_model(
@@ -540,6 +563,55 @@ class ModelRunner:
             reset_context()
 
         self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def capture_verify_cudagraph(self):
+        # Verify graphs share the decode attention kernel but are sized for
+        # bs * seqlen_q query tokens (seqlen_q = spec_len + 1). Reuses the
+        # decode graph_pool so buffers live in the same mempool.
+        config = self.config
+        hf_config = config.hf_config
+        seqlen_q = self.verify_seqlen_q
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_N = max_bs * seqlen_q
+        input_ids = torch.zeros(max_N, dtype=torch.int64)
+        positions = torch.zeros(max_N, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_N, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_N, hf_config.hidden_size)
+        self.verify_graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.verify_graphs = {}
+        # start from decode pool so allocations can be shared
+        pool = self.graph_pool
+
+        for bs in reversed(self.verify_graph_bs):
+            N = bs * seqlen_q
+            graph = torch.cuda.CUDAGraph()
+            set_context(
+                False,
+                slot_mapping=slot_mapping[:N],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
+            outputs[:N] = self.model(input_ids[:N], positions[:N])  # warmup
+            with torch.cuda.graph(graph, pool):
+                outputs[:N] = self.model(input_ids[:N], positions[:N])  # capture
+            if pool is None:
+                pool = graph.pool()
+            self.verify_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.verify_graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
