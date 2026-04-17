@@ -60,7 +60,13 @@ def example():
 
     sampling_params = SamplingParams(temperature=0.1, max_tokens=256)
     prompts = [
-        "who are you?",
+        # "who are you?",
+        # "who is neil armstrong?",
+        # "who is buzz aldrin?",
+        # "who is barack obama?",
+        "write me a longform poem about Pittsburgh. About a page. ",
+        # "what is the usual weather in Tokyo in the summer?",
+        # "write me a fake plot synopsis for fast and furious 15"
     ]
     if tokenizer.chat_template:
         prompts = [
@@ -78,6 +84,17 @@ def example():
             "The assistant gives helpful, detailed, and polite answers to the user's questions."
         )
         prompts = [f"{system} USER: {prompt} ASSISTANT:" for prompt in prompts]
+
+    warmup_max_tokens = max(8, spec_length + 1) if use_spec else 8
+    warmup_params = SamplingParams(
+        temperature=1e-4,
+        ignore_eos=True,
+        max_tokens=warmup_max_tokens,
+    )
+    with torch.profiler.record_function("example.warmup"):
+        llm.generate(prompts[:1], warmup_params, use_tqdm=False)
+        torch.cuda.synchronize()
+    print(f"Warmup done (max_tokens={warmup_max_tokens})")
 
     # snapshot spec counters so we only report drafts from this run
     drafts_before = llm.spec_drafts_total

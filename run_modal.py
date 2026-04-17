@@ -26,8 +26,29 @@ Usage:
     # Profile full bench.py execution (CPU + CUDA) and save trace JSON to Modal volume
     modal run run_modal.py --target bench --profile
 
+    # Profile with eager kernels (no CUDA graph replay)
+    modal run run_modal.py --target bench --profile --enforce-eager
+
+    # Disabled (can deadlock): Python stack traces in profiler events
+    # modal run run_modal.py --target bench --profile --profile-with-stack
+
     # Pull traces locally
     modal volume get nano-vllm-profiler-traces / ./traces
+
+Profiling flags:
+    --profile
+        Enable full-script PyTorch profiling and export a .pt.trace.json file.
+    --profile-label
+        Optional output trace label used in the trace directory name.
+    --profile-record-shapes
+        Record tensor shapes for profiled ops.
+    --profile-memory
+        Record memory usage events.
+    # --profile-with-stack (disabled)
+    #     Record Python stack traces for events; useful for attribution but slower.
+    #     Disabled due to deadlocks/stalls during profiling finalization/export.
+    --enforce-eager
+        Disable CUDA graph replay during execution (independent of --profile).
 """
 
 from __future__ import annotations
@@ -108,7 +129,8 @@ def run_target(
     profile_label: str = "",
     profile_record_shapes: bool = True,
     profile_memory: bool = False,
-    profile_with_stack: bool = False,
+    # profile_with_stack: bool = False,
+    enforce_eager: bool = False,
 ) -> None:
     import os
     import runpy
@@ -124,9 +146,18 @@ def run_target(
         )
     if spec_length < 1:
         raise ValueError(f"spec_length must be >= 1, got {spec_length}")
+    # if profile and profile_with_stack and not enforce_eager:
+    #     print(
+    #         "Profiler warning: disabling --profile-with-stack in CUDA graph mode "
+    #         "(known to stall during trace finalization). Use --enforce-eager "
+    #         "if you need Python stacks."
+    #     )
+    #     profile_with_stack = False
+
     print("Target: ", target)
     print(f"Spec: mode={spec_mode_norm} length={spec_length}")
     print(f"Profiler: enabled={profile}")
+    print(f"Enforce eager: {enforce_eager}")
 
     main_repo = main_model or "Qwen/Qwen3-8B"
     os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
@@ -138,7 +169,7 @@ def run_target(
     # propagate spec config to the target script via env
     os.environ["SPEC_MODE"] = spec_mode_norm
     os.environ["SPEC_LENGTH"] = str(spec_length)
-    os.environ["ENFORCE_EAGER"] = "1" if profile else "0"
+    os.environ["ENFORCE_EAGER"] = "1" if enforce_eager else "0"
 
     workspace_dir = "/workspace"
     if workspace_dir not in sys.path:
@@ -166,10 +197,13 @@ def run_target(
         ],
         record_shapes=profile_record_shapes,
         profile_memory=profile_memory,
-        with_stack=profile_with_stack,
+        # with_stack=profile_with_stack,
+        with_stack=False,
     ) as prof:
         runpy.run_path(script_path, run_name="__main__")
 
+    torch.cuda.synchronize()
+    print(f"Exporting profiler trace to {trace_path}...")
     prof.export_chrome_trace(str(trace_path))
     trace_volume.commit()
     print(f"Profiler trace saved to modal volume: {trace_path}")
@@ -188,7 +222,8 @@ def main(
     profile_label: str = "",
     profile_record_shapes: bool = True,
     profile_memory: bool = False,
-    profile_with_stack: bool = False,
+    # profile_with_stack: bool = False,
+    enforce_eager: bool = False,
 ):
     try:
         run_target.remote(
@@ -203,7 +238,8 @@ def main(
             profile_label,
             profile_record_shapes,
             profile_memory,
-            profile_with_stack,
+            # profile_with_stack,
+            enforce_eager,
         )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")
