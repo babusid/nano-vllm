@@ -28,7 +28,7 @@ def example():
     main_model_config = Config(
         model=main_model_path,
         max_model_len=4096,
-        enforce_eager=False,
+        enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
         gpu_memory_utilization=0.8,
     )
     print("Main Model Path: ", main_model_path)
@@ -43,7 +43,7 @@ def example():
         small_model_config = Config(
             model=small_model_path,
             max_model_len=4096,
-            enforce_eager=False,
+            enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
             gpu_memory_utilization=0.5,
         )
         print("Small Model Path: ", small_model_path)
