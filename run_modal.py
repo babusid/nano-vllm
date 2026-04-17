@@ -23,6 +23,13 @@ Usage:
     # MEDUSA with pretrained Vicuna-7B heads (FasterDecoding/medusa-vicuna-7b-v1.3)
     modal run run_modal.py --target bench_speculative --model "lmsys/vicuna-7b-v1.3" --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" --extra-args "--method medusa --num-heads 5 --compare"
 
+    # MEDUSA with Vicuna heads + ShareGPT dataset (most realistic benchmark)
+    modal run run_modal.py --target bench_speculative \\
+        --model "lmsys/vicuna-7b-v1.3" \\
+        --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" \\
+        --sharegpt-dataset "anon8231489123/ShareGPT_Vicuna_unfiltered" \\
+        --extra-args "--method medusa --num-heads 5 --compare --num-seqs 200 --dataset sharegpt"
+
     # AR baseline only
     modal run run_modal.py --target bench_speculative --model "Qwen/Qwen3-0.6B"
 """
@@ -76,6 +83,68 @@ def _download_model(repo_id: str, revision: str = "") -> str:
     return model_path
 
 
+def _download_sharegpt(repo_id: str, revision: str = "") -> str:
+    """Download the ShareGPT dataset file and return the path to the JSON.
+
+    The canonical benchmark source used by vLLM / SGLang is:
+      anon8231489123/ShareGPT_Vicuna_unfiltered
+    which contains ShareGPT_V3_unfiltered_cleaned_split.json.
+
+    We attempt to download that specific file first; if it is not present in
+    the repo we fall back to a full snapshot and pick the best JSON candidate.
+    """
+    from huggingface_hub import hf_hub_download, snapshot_download
+    import glob as _glob
+    import os as _os
+
+    repo_name = repo_id.rstrip("/").split("/")[-1]
+    dataset_dir = f"/root/sharegpt/{repo_name}"
+    _os.makedirs(dataset_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------ #
+    # Attempt 1: download the canonical vLLM benchmark file directly.
+    # ------------------------------------------------------------------ #
+    canonical_name = "ShareGPT_V3_unfiltered_cleaned_split.json"
+    try:
+        json_path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=canonical_name,
+            local_dir=dataset_dir,
+            **({"revision": revision} if revision else {}),
+        )
+        print(f"[ShareGPT] Using dataset file: {json_path}")
+        return json_path
+    except Exception:
+        pass  # file not in repo, fall through to snapshot
+
+    # ------------------------------------------------------------------ #
+    # Attempt 2: snapshot the whole repo (skip large non-JSON files).
+    # ------------------------------------------------------------------ #
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=dataset_dir,
+        ignore_patterns=["*.bin", "*.safetensors", "*.parquet", "*.arrow"],
+        **({"revision": revision} if revision else {}),
+    )
+
+    candidates = sorted(_glob.glob(f"{dataset_dir}/**/*.json", recursive=True))
+    # Prefer files that look like the vLLM benchmark file.
+    priority = [
+        p for p in candidates
+        if "V3" in p or ("unfiltered" in p and "cleaned" in p and "split" in p)
+    ]
+    json_path = priority[0] if priority else (candidates[0] if candidates else None)
+
+    if not json_path:
+        raise FileNotFoundError(
+            f"No JSON file found in downloaded ShareGPT dataset at {dataset_dir}"
+        )
+    print(f"[ShareGPT] Using dataset file: {json_path}")
+    return json_path
+
+
 def _download_medusa_heads(repo_id: str, revision: str = "") -> str:
     """Download just the MEDUSA heads file and return the directory path.
 
@@ -116,6 +185,8 @@ def run_target(
     extra_args: str = "",
     medusa_heads_model: str = "",
     medusa_heads_revision: str = "",
+    sharegpt_dataset: str = "",
+    sharegpt_revision: str = "",
 ) -> tuple[int, str, str]:
     import os
     import subprocess
@@ -139,6 +210,11 @@ def run_target(
             heads_dir = _download_medusa_heads(medusa_heads_model, medusa_heads_revision)
             env["MEDUSA_HEADS_PATH"] = heads_dir
             print(f"[MEDUSA] Heads downloaded to {heads_dir}")
+        # Optionally download ShareGPT dataset from HuggingFace
+        if sharegpt_dataset:
+            json_path = _download_sharegpt(sharegpt_dataset, sharegpt_revision)
+            env["SHAREGPT_PATH"] = json_path
+            print(f"[ShareGPT] Dataset path set to {json_path}")
     else:
         env["MODEL_PATH"] = _download_model(model, revision)
 
@@ -168,6 +244,8 @@ def main(
     extra_args: str = "",
     medusa_heads_model: str = "",
     medusa_heads_revision: str = "",
+    sharegpt_dataset: str = "",
+    sharegpt_revision: str = "",
 ):
     try:
         returncode, stdout, stderr = run_target.remote(
@@ -181,6 +259,8 @@ def main(
             extra_args,
             medusa_heads_model,
             medusa_heads_revision,
+            sharegpt_dataset,
+            sharegpt_revision,
         )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")
