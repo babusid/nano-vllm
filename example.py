@@ -77,8 +77,8 @@ def example():
             "A chat between a curious user and an artificial intelligence assistant. "
             "The assistant gives helpful, detailed, and polite answers to the user's questions."
         )
-        for prompt in prompts
-    ]
+        prompts = [f"{system} USER: {prompt} ASSISTANT:" for prompt in prompts]
+
     # snapshot spec counters so we only report drafts from this run
     drafts_before = llm.spec_drafts_total
     accepted_before = llm.spec_accepted_total
