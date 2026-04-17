@@ -25,21 +25,23 @@ Usage:
     modal run run_modal.py --target arc --mode medusa \
         --model "FasterDecoding/medusa-vicuna-7b-v1.3"
 
-    # Run MEDUSA vs AR comparison benchmark (bench_speculative.py)
-    modal run run_modal.py --target bench_speculative --model "Qwen/Qwen3-0.6B" --extra-args "--method medusa --num-heads 4 --compare"
-
-    # MEDUSA with pretrained Vicuna-7B heads (FasterDecoding/medusa-vicuna-7b-v1.3)
-    modal run run_modal.py --target bench_speculative --model "lmsys/vicuna-7b-v1.3" --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" --extra-args "--method medusa --num-heads 5 --compare"
+    # MEDUSA vs AR — greedy, single-sequence (intended sweet spot, expect ~1.5-2.5x speedup)
+    modal run run_modal.py --target bench_speculative \
+        --model "lmsys/vicuna-7b-v1.3" \
+        --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" \
+        --extra-args "--method medusa --num-heads 5 --compare --num-seqs 1 --temperature 0 --show-output --chat-template vicuna --max-output-len 256"
 
     # MEDUSA with Vicuna heads + ShareGPT dataset (most realistic benchmark)
-    modal run run_modal.py --target bench_speculative \\
-        --model "lmsys/vicuna-7b-v1.3" \\
-        --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" \\
-        --sharegpt-dataset "anon8231489123/ShareGPT_Vicuna_unfiltered" \\
-        --extra-args "--method medusa --num-heads 5 --compare --num-seqs 200 --dataset sharegpt"
+    modal run run_modal.py --target bench_speculative \
+        --model "lmsys/vicuna-7b-v1.3" \
+        --medusa-heads-model "FasterDecoding/medusa-vicuna-7b-v1.3" \
+        --sharegpt-dataset "anon8231489123/ShareGPT_Vicuna_unfiltered" \
+        --extra-args "--method medusa --num-heads 5 --compare --num-seqs 1 --temperature 0 --dataset sharegpt --chat-template vicuna"
 
-    # AR baseline only
-    modal run run_modal.py --target bench_speculative --model "Qwen/Qwen3-0.6B"
+    # AR baseline only (Vicuna)
+    modal run run_modal.py --target bench_speculative \
+        --model "lmsys/vicuna-7b-v1.3" \
+        --extra-args "--num-seqs 1 --temperature 0 --show-output --chat-template vicuna"
 """
 
 from __future__ import annotations
@@ -210,13 +212,9 @@ def run_target(
     import os
     import subprocess
 
-    valid_targets = {"bench", "example", "bench_speculative"}
+    valid_targets = {"bench", "example", "bench_speculative", "arc", "medusa"}
     if target not in valid_targets:
         raise ValueError(f"target must be one of {sorted(valid_targets)}, got {target!r}")
-    print("Target: ", target)
-    _VALID = {"bench", "example", "arc", "medusa"}
-    if target not in _VALID:
-        raise ValueError(f"target must be one of {sorted(_VALID)}, got {target!r}")
     print("Target:", target)
     env = os.environ.copy()
 
@@ -265,8 +263,11 @@ def run_target(
         env["MODEL_PATH"] = _download_model(model, revision)
 
     script_name = {"arc": "bench_arc", "medusa": "bench_medusa"}.get(target, target)
+    cmd = ["python", f"/workspace/{script_name}.py"]
+    if extra_args:
+        cmd += extra_args.split()
     result = subprocess.run(
-        ["python", f"/workspace/{script_name}.py"],
+        cmd,
         cwd="/workspace",
         env=env,
         capture_output=True,
@@ -284,6 +285,11 @@ def main(
     main_revision: str = "",
     spec_model: str = "Qwen/Qwen3-0.6B",
     spec_revision: str = "",
+    extra_args: str = "",
+    medusa_heads_model: str = "",
+    medusa_heads_revision: str = "",
+    sharegpt_dataset: str = "",
+    sharegpt_revision: str = "",
     mode: str = "",
 ):
     try:
@@ -295,6 +301,11 @@ def main(
             main_revision,
             spec_model,
             spec_revision,
+            extra_args,
+            medusa_heads_model,
+            medusa_heads_revision,
+            sharegpt_dataset,
+            sharegpt_revision,
             mode,
         )
     except Exception as exc:  # pragma: no cover

@@ -338,12 +338,19 @@ def parse_args():
                         "directory containing it. Falls back to MEDUSA_HEADS_PATH env var.")
     p.add_argument("--compare", action="store_true",
                    help="Run both AR and speculative and compare side by side")
-    p.add_argument("--num-seqs", type=int, default=128,
-                   help="Number of sequences to generate (default: 128). "
-                        "Use 1 for MEDUSA's intended single-sequence sweet spot.")
+    p.add_argument("--num-seqs", type=int, default=1,
+                   help="Number of sequences to generate (default: 1). "
+                        "MEDUSA is designed for the single-sequence, memory-bandwidth-bound "
+                        "regime where draft verification costs almost the same as AR. "
+                        "With large batches the GPU becomes compute-bound and MEDUSA's τ "
+                        "must exceed K to break even.")
     p.add_argument("--max-output-len", type=int, default=256,
                    help="Maximum tokens to generate per sequence (default: 256)")
-    p.add_argument("--temperature", type=float, default=0.6)
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Sampling temperature (default: 0.0). "
+                        "MEDUSA Phase-1 uses greedy acceptance; temperature > 0 "
+                        "requires Phase-2 stochastic acceptance (not yet implemented) "
+                        "and will reduce acceptance rates.")
     p.add_argument("--seed", type=int, default=0)
     # Dataset selection
     p.add_argument("--dataset", default="synthetic",

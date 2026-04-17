@@ -352,6 +352,83 @@ class ModelRunner:
             f"({config.medusa_num_layers} ResBlock layer(s) each)."
         )
 
+        if not self.enforce_eager:
+            self.capture_verify_cudagraph(config.medusa_num_heads)
+
+    @torch.inference_mode()
+    def capture_verify_cudagraph(self, K: int):
+        """Capture a single-sequence CUDA graph for the MEDUSA verification pass.
+
+        The graph processes (K+1) draft tokens in prefill/FlashAttention-varlen mode.
+        All tensor *shapes* are fixed (K+1 is constant); only the *values* of
+        slot_mapping, cu_seqlens_k, and block_tables are mutated before each replay —
+        exactly the same pattern used by the existing decode CUDA graph.
+
+        max_seqlen_k is baked into the graph as max_model_len+K+1 (a safe upper
+        bound).  FlashAttention still attends only to the range determined by
+        cu_seqlens_k, so correctness is maintained even when max_seqlen_k exceeds
+        the actual sequence length at a given step.
+        """
+        config = self.config
+        hf_config = config.hf_config
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        # Persistent fixed-shape tensors — values are mutated before every replay.
+        ver_input_ids    = torch.zeros(K + 1, dtype=torch.int64, device="cuda")
+        ver_positions    = torch.arange(K + 1, dtype=torch.int64, device="cuda")
+        # Use -1 sentinel during warmup/capture so store_kvcache writes nothing.
+        ver_slot_mapping = torch.full((K + 1,), -1, dtype=torch.int32, device="cuda")
+        ver_cu_seqlens_q = torch.tensor([0, K + 1], dtype=torch.int32, device="cuda")
+        # IMPORTANT: must be non-zero at capture time so flash_attn actually launches
+        # its attention kernel.  If [0, 0], flash_attn sees 0 key tokens and returns
+        # early without a kernel launch; the graph then captures a no-op and produces
+        # all-zeros hidden states at every replay regardless of cu_seqlens_k updates.
+        ver_cu_seqlens_k = torch.tensor([0, K + 1], dtype=torch.int32, device="cuda")
+        ver_block_tables = torch.zeros(1, max_num_blocks, dtype=torch.int32, device="cuda")
+        ver_outputs      = torch.zeros(
+            K + 1, hf_config.hidden_size, dtype=self.model_dtype, device="cuda"
+        )
+
+        # max_seqlen_k is a Python integer baked into the graph at capture time.
+        max_seqlen_k = config.max_model_len + K + 1
+
+        set_context(
+            True,              # is_prefill → flash_attn_varlen_func path
+            ver_cu_seqlens_q,
+            ver_cu_seqlens_k,
+            K + 1,             # max_seqlen_q (fixed)
+            max_seqlen_k,      # max_seqlen_k (baked)
+            ver_slot_mapping,
+            None,              # context_lens (decode-mode only)
+            ver_block_tables,
+            all_logits=True,
+        )
+
+        # Warmup: slot_mapping=-1 prevents KV cache corruption during warmup.
+        ver_outputs[:] = self.model(ver_input_ids, ver_positions)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, self.graph_pool):
+            ver_outputs[:] = self.model(ver_input_ids, ver_positions)
+        torch.cuda.synchronize()
+        reset_context()
+
+        self.verify_graph = graph
+        self.verify_graph_vars = {
+            "input_ids":    ver_input_ids,
+            "positions":    ver_positions,
+            "slot_mapping": ver_slot_mapping,
+            "cu_seqlens_k": ver_cu_seqlens_k,
+            "block_tables": ver_block_tables,
+            "outputs":      ver_outputs,
+        }
+        self.verify_max_seqlen_k = max_seqlen_k
+        print(
+            f"[MEDUSA] Captured verification CUDA graph "
+            f"(K+1={K + 1} tokens, max_seqlen_k={max_seqlen_k})."
+        )
+
     def prepare_verify(
         self,
         seqs: list[Sequence],
@@ -411,17 +488,37 @@ class ModelRunner:
 
         K = self.config.medusa_num_heads
 
-        # Draft pass
+        # Draft pass — reuse the existing decode CUDA graph so both decode and
+        # verify benefit from graph-replay speed (no Python dispatch overhead).
         input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
 
-        # Run base model
-        hidden_states = self.model(input_ids, positions)  # [bs, hidden_size]
+        bs = len(seqs)
+        if not self.enforce_eager and bs <= 512:
+            ctx = get_context()
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            gv = self.graph_vars
+            gv["input_ids"][:bs] = input_ids
+            gv["positions"][:bs] = positions
+            gv["slot_mapping"].fill_(-1)
+            gv["slot_mapping"][:bs] = ctx.slot_mapping
+            gv["context_lens"].zero_()
+            gv["context_lens"][:bs] = ctx.context_lens
+            gv["block_tables"][:bs, :ctx.block_tables.size(1)] = ctx.block_tables
+            graph.replay()
+            hidden_states = gv["outputs"][:bs].clone()
+            logits = self.model.compute_logits(hidden_states)
+        else:
+            hidden_states = self.model(input_ids, positions)  # [bs, hidden_size]
+            logits = self.model.compute_logits(hidden_states)
         reset_context()
 
         if self.rank == 0:
-            logits = self.model.compute_logits(hidden_states)  # [bs, vocab_size]
-            d0_tokens = self.sampler(logits, temperatures).tolist()
+            # Phase-1 MEDUSA requires d0 to be the greedy argmax token.
+            # The draft heads predict c1..cK from h_{N-1} under the assumption that
+            # d0 = argmax(lm_head(h_{N-1})). Stochastic sampling here would mismatch
+            # the verification pass and collapse acceptance rates to near-zero.
+            d0_tokens = logits.argmax(dim=-1).tolist()
 
             # MEDUSA draft heads
             draft_output = self.speculative_decoder.draft(hidden_states, seqs)
@@ -448,7 +545,35 @@ class ModelRunner:
 
         # Verification pass
         verify_input_ids, verify_positions = self.prepare_verify(seqs, full_drafts)
-        verify_hidden = self.model(verify_input_ids, verify_positions)
+
+        # Use the captured CUDA graph for single-sequence speculative decoding.
+        # All tensor shapes are fixed (K+1 tokens); only values (slot_mapping,
+        # cu_seqlens_k, block_tables) are updated before each replay.
+        use_verify_graph = (
+            hasattr(self, "verify_graph")
+            and not self.enforce_eager
+            and len(seqs) == 1
+        )
+        if use_verify_graph:
+            ctx = get_context()  # set by prepare_verify (all_logits=True)
+            gv = self.verify_graph_vars
+            gv["input_ids"].copy_(verify_input_ids, non_blocking=True)
+            gv["positions"].copy_(verify_positions, non_blocking=True)
+            gv["slot_mapping"].copy_(ctx.slot_mapping, non_blocking=True)
+            gv["cu_seqlens_k"][0] = 0
+            gv["cu_seqlens_k"][1] = ctx.cu_seqlens_k[1]  # actual N + K + 1
+            bt_cols = ctx.block_tables.size(1)
+            gv["block_tables"][0, :bt_cols].copy_(ctx.block_tables[0], non_blocking=True)
+            if bt_cols < gv["block_tables"].size(1):
+                gv["block_tables"][0, bt_cols:] = 0
+            # Replay: CUDA kernels re-run with the updated tensor VALUES via the
+            # captured data pointers.  Python context from prepare_verify remains
+            # live so compute_logits below can read all_logits=True.
+            self.verify_graph.replay()
+            verify_hidden = gv["outputs"].clone()
+        else:
+            verify_hidden = self.model(verify_input_ids, verify_positions)
+
         verify_logits = self.model.compute_logits(verify_hidden)
         reset_context()
 
