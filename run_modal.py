@@ -156,6 +156,24 @@ def run_target(
     profile_memory: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
+    bench_num_seqs: int = 64,
+    bench_max_input_len: int = 1024,
+    bench_max_output_len: int = 1024,
+    bench_seed: int = 0,
+    bench_temperature: float = 0.1,
+    bench_warmup_seqs: int = 32,
+    bench_main_max_model_len: int = 4096,
+    bench_main_gpu_memory_utilization: float = 0.8,
+    bench_spec_max_model_len: int = 4096,
+    bench_spec_gpu_memory_utilization: float = 0.5,
+    example_temperature: float = 1e-9,
+    example_max_tokens: int = 256,
+    example_prompt: str = "write me a longform poem about Pittsburgh. About a page. ",
+    example_warmup_base_tokens: int = 8,
+    example_main_max_model_len: int = 4096,
+    example_main_gpu_memory_utilization: float = 0.8,
+    example_spec_max_model_len: int = 4096,
+    example_spec_gpu_memory_utilization: float = 0.5,
 ) -> None:
     import os
     import runpy
@@ -196,7 +214,34 @@ def run_target(
     os.environ["SPEC_LENGTH"] = str(spec_length)
     os.environ["ENFORCE_EAGER"] = "1" if enforce_eager else "0"
     if target == "bench":
+        os.environ["BENCH_NUM_SEQS"] = str(bench_num_seqs)
+        os.environ["BENCH_MAX_INPUT_LEN"] = str(bench_max_input_len)
+        os.environ["BENCH_MAX_OUTPUT_LEN"] = str(bench_max_output_len)
+        os.environ["BENCH_SEED"] = str(bench_seed)
+        os.environ["BENCH_TEMPERATURE"] = str(bench_temperature)
+        os.environ["BENCH_WARMUP_SEQS"] = str(bench_warmup_seqs)
+        os.environ["BENCH_MAIN_MAX_MODEL_LEN"] = str(bench_main_max_model_len)
+        os.environ["BENCH_MAIN_GPU_MEMORY_UTILIZATION"] = str(
+            bench_main_gpu_memory_utilization
+        )
+        os.environ["BENCH_SPEC_MAX_MODEL_LEN"] = str(bench_spec_max_model_len)
+        os.environ["BENCH_SPEC_GPU_MEMORY_UTILIZATION"] = str(
+            bench_spec_gpu_memory_utilization
+        )
         os.environ["SHAREGPT_PATH"] = _download_sharegpt()
+    else:
+        os.environ["EXAMPLE_TEMPERATURE"] = str(example_temperature)
+        os.environ["EXAMPLE_MAX_TOKENS"] = str(example_max_tokens)
+        os.environ["EXAMPLE_PROMPT"] = example_prompt
+        os.environ["EXAMPLE_WARMUP_BASE_TOKENS"] = str(example_warmup_base_tokens)
+        os.environ["EXAMPLE_MAIN_MAX_MODEL_LEN"] = str(example_main_max_model_len)
+        os.environ["EXAMPLE_MAIN_GPU_MEMORY_UTILIZATION"] = str(
+            example_main_gpu_memory_utilization
+        )
+        os.environ["EXAMPLE_SPEC_MAX_MODEL_LEN"] = str(example_spec_max_model_len)
+        os.environ["EXAMPLE_SPEC_GPU_MEMORY_UTILIZATION"] = str(
+            example_spec_gpu_memory_utilization
+        )
 
     workspace_dir = "/workspace"
     if workspace_dir not in sys.path:
@@ -251,6 +296,24 @@ def main(
     profile_memory: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
+    bench_num_seqs: int = 64,
+    bench_max_input_len: int = 1024,
+    bench_max_output_len: int = 1024,
+    bench_seed: int = 0,
+    bench_temperature: float = 0.1,
+    bench_warmup_seqs: int = 32,
+    bench_main_max_model_len: int = 4096,
+    bench_main_gpu_memory_utilization: float = 0.8,
+    bench_spec_max_model_len: int = 4096,
+    bench_spec_gpu_memory_utilization: float = 0.5,
+    example_temperature: float = 1e-9,
+    example_max_tokens: int = 256,
+    example_prompt: str = "write me a longform poem about Pittsburgh. About a page. ",
+    example_warmup_base_tokens: int = 8,
+    example_main_max_model_len: int = 4096,
+    example_main_gpu_memory_utilization: float = 0.8,
+    example_spec_max_model_len: int = 4096,
+    example_spec_gpu_memory_utilization: float = 0.5,
 ):
     try:
         run_target.remote(
@@ -267,6 +330,24 @@ def main(
             profile_memory,
             # profile_with_stack,
             enforce_eager,
+            bench_num_seqs,
+            bench_max_input_len,
+            bench_max_output_len,
+            bench_seed,
+            bench_temperature,
+            bench_warmup_seqs,
+            bench_main_max_model_len,
+            bench_main_gpu_memory_utilization,
+            bench_spec_max_model_len,
+            bench_spec_gpu_memory_utilization,
+            example_temperature,
+            example_max_tokens,
+            example_prompt,
+            example_warmup_base_tokens,
+            example_main_max_model_len,
+            example_main_gpu_memory_utilization,
+            example_spec_max_model_len,
+            example_spec_gpu_memory_utilization,
         )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")

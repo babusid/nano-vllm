@@ -69,7 +69,16 @@ def bench():
     max_input_len = int(os.environ.get("BENCH_MAX_INPUT_LEN", "1024"))
     max_output_len = int(os.environ.get("BENCH_MAX_OUTPUT_LEN", "1024"))
     sampling_seed = int(os.environ.get("BENCH_SEED", "0"))
-    temperature = float(os.environ.get("BENCH_TEMPERATURE", "0.6"))
+    temperature = float(os.environ.get("BENCH_TEMPERATURE", "1e-9"))
+    warmup_seqs = int(os.environ.get("BENCH_WARMUP_SEQS", "32"))
+    main_max_model_len = int(os.environ.get("BENCH_MAIN_MAX_MODEL_LEN", "4096"))
+    main_gpu_memory_utilization = float(
+        os.environ.get("BENCH_MAIN_GPU_MEMORY_UTILIZATION", "0.8")
+    )
+    spec_max_model_len = int(os.environ.get("BENCH_SPEC_MAX_MODEL_LEN", "4096"))
+    spec_gpu_memory_utilization = float(
+        os.environ.get("BENCH_SPEC_GPU_MEMORY_UTILIZATION", "0.5")
+    )
 
     # speculation config comes from env so run_modal.py flags can propagate
     spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
@@ -84,9 +93,9 @@ def bench():
     )
     main_model_config = Config(
         model=main_model_path,
-        max_model_len=4096,
+        max_model_len=main_max_model_len,
         enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=main_gpu_memory_utilization,
     )
     print("Main Model Path: ", main_model_path)
 
@@ -100,9 +109,9 @@ def bench():
         )
         small_model_config = Config(
             model=small_model_path,
-            max_model_len=4096,
+            max_model_len=spec_max_model_len,
             enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=spec_gpu_memory_utilization,
         )
         print("Small Model Path: ", small_model_path)
         spec_kwargs = dict(
@@ -130,7 +139,7 @@ def bench():
     print(f"Loaded {len(prompts)} prompts.")
 
     # Warmup pass so kernel compilation/setup does not pollute benchmark timing.
-    warmup_n = min(32, num_seqs)
+    warmup_n = min(warmup_seqs, num_seqs)
     llm.generate(prompts[:warmup_n], sampling_params[:warmup_n], use_tqdm=False)
     torch.cuda.synchronize()
     print("Warmup done")

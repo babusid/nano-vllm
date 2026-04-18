@@ -5,10 +5,24 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.config import Config
 from transformers import AutoTokenizer
 from nanovllm.engine.llm_engine import SpeculationMode
-from nanovllm.config import Config
 
 
 def example():
+    temperature = float(os.environ.get("EXAMPLE_TEMPERATURE", "1e-9"))
+    max_tokens = int(os.environ.get("EXAMPLE_MAX_TOKENS", "256"))
+    prompt_text = os.environ.get(
+        "EXAMPLE_PROMPT", "write me a longform poem about Pittsburgh. About a page. "
+    )
+    warmup_base_tokens = int(os.environ.get("EXAMPLE_WARMUP_BASE_TOKENS", "8"))
+    main_max_model_len = int(os.environ.get("EXAMPLE_MAIN_MAX_MODEL_LEN", "4096"))
+    main_gpu_memory_utilization = float(
+        os.environ.get("EXAMPLE_MAIN_GPU_MEMORY_UTILIZATION", "0.8")
+    )
+    spec_max_model_len = int(os.environ.get("EXAMPLE_SPEC_MAX_MODEL_LEN", "4096"))
+    spec_gpu_memory_utilization = float(
+        os.environ.get("EXAMPLE_SPEC_GPU_MEMORY_UTILIZATION", "0.5")
+    )
+
     example = os.path.expanduser(
         os.environ.get("MAIN_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
     )
@@ -27,9 +41,9 @@ def example():
     )
     main_model_config = Config(
         model=main_model_path,
-        max_model_len=4096,
+        max_model_len=main_max_model_len,
         enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=main_gpu_memory_utilization,
     )
     print("Main Model Path: ", main_model_path)
 
@@ -42,9 +56,9 @@ def example():
         )
         small_model_config = Config(
             model=small_model_path,
-            max_model_len=4096,
+            max_model_len=spec_max_model_len,
             enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
-            gpu_memory_utilization=0.5,
+            gpu_memory_utilization=spec_gpu_memory_utilization,
         )
         print("Small Model Path: ", small_model_path)
         spec_kwargs = dict(
@@ -58,13 +72,13 @@ def example():
         **spec_kwargs,
     )
 
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=256)
+    sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
     prompts = [
         # "who are you?",
         # "who is neil armstrong?",
         # "who is buzz aldrin?",
         # "who is barack obama?",
-        "write me a longform poem about Pittsburgh. About a page. ",
+        prompt_text,
         # "what is the usual weather in Tokyo in the summer?",
         # "write me a fake plot synopsis for fast and furious 15"
     ]
@@ -85,7 +99,9 @@ def example():
         )
         prompts = [f"{system} USER: {prompt} ASSISTANT:" for prompt in prompts]
 
-    warmup_max_tokens = max(8, spec_length + 1) if use_spec else 8
+    warmup_max_tokens = (
+        max(warmup_base_tokens, spec_length + 1) if use_spec else warmup_base_tokens
+    )
     warmup_params = SamplingParams(
         temperature=1e-4,
         ignore_eos=True,
