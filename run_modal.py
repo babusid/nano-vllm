@@ -300,7 +300,7 @@ def main(
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
     bench_seed: int = 0,
-    bench_temperature: float = 0.1,
+    bench_temperature: float = 1e-9,
     bench_warmup_seqs: int = 32,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
