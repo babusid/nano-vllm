@@ -79,4 +79,6 @@ def get_rope(
     cls: type = RotaryEmbedding,
 ):
     rope_scaling_key = _freeze(rope_scaling)
-    return _get_rope_cached(head_size, rotary_dim, max_position, base, rope_scaling_key, cls)
+    return _get_rope_cached(
+        head_size, rotary_dim, max_position, base, rope_scaling_key, cls
+    )

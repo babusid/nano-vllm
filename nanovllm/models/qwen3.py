@@ -16,13 +16,17 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3RMSNorm(RMSNorm):
-    @torch.compile
-    def rms_forward(self, x):
-        return RMSNorm.rms_forward(self, x)
+    def rms_forward_2d(self, x):
+        return RMSNorm.rms_forward_2d(self, x)
 
-    @torch.compile
-    def add_rms_forward(self, x, residual):
-        return RMSNorm.add_rms_forward(self, x, residual)
+    def rms_forward_3d(self, x):
+        return RMSNorm.rms_forward_3d(self, x)
+
+    def add_rms_forward_2d(self, x, residual):
+        return RMSNorm.add_rms_forward_2d(self, x, residual)
+
+    def add_rms_forward_3d(self, x, residual):
+        return RMSNorm.add_rms_forward_3d(self, x, residual)
 
 
 class Qwen3SiluAndMul(SiluAndMul):

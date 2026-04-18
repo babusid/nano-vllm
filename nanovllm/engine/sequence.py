@@ -20,18 +20,55 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params=SamplingParams()):
-        self.seq_id = next(Sequence.counter)  # uniquely identify this sequence
-        self.status = SequenceStatus.WAITING  # start off as waiting until scheduled
-        self.token_ids = copy(token_ids)  # if we're given token_ids, copy them in
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params=SamplingParams(),
+        num_block_tables: int = 1,
+    ):
+        # uniquely identify this sequence
+        self.seq_id = next(Sequence.counter)
+
+        # start off as waiting until scheduled
+        self.status = SequenceStatus.WAITING
+
+        # if we're given token_ids, copy them in
+        self.token_ids = copy(token_ids)
+
+        # staging area for draft tokens
+        # one of the lists is for the verifier
+        # and will be empty the whole time. This specific initialization
+        # is relied in the model runner.
+        self.draft_token_ids = [[] for _ in range(num_block_tables)]
+        self.draft_token_logits = [[] for _ in range(num_block_tables)]
+
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.block_table = []  # no block memory allocated yet for this sequence
+
+        # no block memory allocated yet for this sequence
+        self._block_tables = [[] for _ in range(num_block_tables)]
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+    @property
+    def block_tables(self) -> list[list[int]]:
+        return self._block_tables
+
+    @block_tables.setter
+    def block_tables(self, value: list[list[int]]):
+        self._block_tables = value
+
+    @property
+    def block_table(self):
+        return self._block_tables[0]
+
+    @block_table.setter
+    def block_table(self, value):
+        self._block_tables[0] = value
 
     def __len__(self):
         return self.num_tokens
@@ -70,7 +107,7 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
-        return self.num_tokens - (self.num_blocks - 1) * self.block_size
+        return ((self.num_tokens - 1) % self.block_size) + 1 if self.num_tokens else 0
 
     def block(self, i):
         """get ith block of this sequence"""
@@ -82,23 +119,67 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def extend(self, token_ids: list[int]):
+        if not token_ids:
+            return
+        self.token_ids.extend(token_ids)
+        self.last_token = token_ids[-1]
+        self.num_tokens += len(token_ids)
+
     def __getstate__(self):
         return (
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
-            self.block_table,
+            self._block_tables,
+            self.draft_token_ids,
+            self.draft_token_logits,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token,
         )
 
     def __setstate__(self, state):
-        (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-        ) = state[:-1]
+        draft_token_ids = None
+        draft_token_logits = None
+        if len(state) == 7:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                block_tables,
+                draft_token_ids,
+                draft_token_logits,
+            ) = state[:-1]
+        elif len(state) == 6:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                block_tables,
+                draft_token_ids,
+            ) = state[:-1]
+        else:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                block_tables,
+            ) = state[:-1]
+        if block_tables and isinstance(block_tables[0], int):
+            self._block_tables = [block_tables]
+        else:
+            self._block_tables = block_tables
+        if draft_token_ids is None:
+            self.draft_token_ids = [[] for _ in range(len(self._block_tables))]
+        elif draft_token_ids and isinstance(draft_token_ids[0], int):
+            self.draft_token_ids = [draft_token_ids]
+        else:
+            self.draft_token_ids = draft_token_ids
+        if draft_token_logits is None:
+            self.draft_token_logits = [[] for _ in range(len(self._block_tables))]
+        else:
+            self.draft_token_logits = draft_token_logits
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
+            self.last_token = self.token_ids[-1]
         else:
             self.last_token = state[-1]

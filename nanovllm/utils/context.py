@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import torch
 
 
+# TODO: single global context variable might become a footgun if we ever overlap
+# different models running simultaneously
 @dataclass
 class Context:
     is_prefill: bool = False
