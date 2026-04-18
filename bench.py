@@ -80,6 +80,8 @@ def bench():
         os.environ.get("BENCH_SPEC_GPU_MEMORY_UTILIZATION", "0.5")
     )
 
+    # use_tqdm = os.environ.get("USE_TQDM", "1") != "0"
+
     # speculation config comes from env so run_modal.py flags can propagate
     spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
     spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
@@ -149,7 +151,7 @@ def bench():
     drafts_before = llm.spec_drafts_total
     accepted_before = llm.spec_accepted_total
     t = time.time()
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
     torch.cuda.synchronize()
     t = time.time() - t
 

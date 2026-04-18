@@ -49,6 +49,9 @@ Profiling flags:
     #     Disabled due to deadlocks/stalls during profiling finalization/export.
     --enforce-eager
         Disable CUDA graph replay during execution (independent of --profile).
+    --no-tqdm
+        Suppress the per-step tqdm progress bar during generation (cleaner logs
+        when capturing output to a file).
 """
 
 from __future__ import annotations
@@ -166,6 +169,7 @@ def run_target(
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
     bench_spec_gpu_memory_utilization: float = 0.5,
+    no_tqdm: bool = False,
     example_temperature: float = 1e-9,
     example_max_tokens: int = 256,
     example_prompt: str = "write me a longform poem about Pittsburgh. About a page. ",
@@ -229,6 +233,7 @@ def run_target(
             bench_spec_gpu_memory_utilization
         )
         os.environ["SHAREGPT_PATH"] = _download_sharegpt()
+        os.environ["USE_TQDM"] = "0" if no_tqdm else "1"
     else:
         os.environ["EXAMPLE_TEMPERATURE"] = str(example_temperature)
         os.environ["EXAMPLE_MAX_TOKENS"] = str(example_max_tokens)
@@ -306,6 +311,7 @@ def main(
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
     bench_spec_gpu_memory_utilization: float = 0.5,
+    no_tqdm: bool = False,
     example_temperature: float = 1e-9,
     example_max_tokens: int = 256,
     example_prompt: str = "write me a longform poem about Pittsburgh. About a page. ",
@@ -340,6 +346,7 @@ def main(
             bench_main_gpu_memory_utilization,
             bench_spec_max_model_len,
             bench_spec_gpu_memory_utilization,
+            no_tqdm,
             example_temperature,
             example_max_tokens,
             example_prompt,
