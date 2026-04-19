@@ -134,7 +134,7 @@ def _download_sharegpt() -> str:
 
 @app.function(
     image=image,
-    gpu="B200:1",
+    gpu="H200:1",
     timeout=7200,
     volumes={
         "/root/huggingface": hf_volume,
@@ -160,13 +160,14 @@ def run_target(
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
     bench_seed: int = 0,
-    bench_temperature: float = 0.1,
+    bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
     bench_spec_gpu_memory_utilization: float = 0.5,
-    example_temperature: float = 1e-9,
+    example_seed: int = 0,
+    example_temperature: float = 0.0,
     example_max_tokens: int = 256,
     example_prompt: str = "write me a longform poem about Pittsburgh. About a page. ",
     example_warmup_base_tokens: int = 8,
@@ -230,6 +231,7 @@ def run_target(
         )
         os.environ["SHAREGPT_PATH"] = _download_sharegpt()
     else:
+        os.environ["EXAMPLE_SEED"] = str(example_seed)
         os.environ["EXAMPLE_TEMPERATURE"] = str(example_temperature)
         os.environ["EXAMPLE_MAX_TOKENS"] = str(example_max_tokens)
         os.environ["EXAMPLE_PROMPT"] = example_prompt
@@ -300,13 +302,14 @@ def main(
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
     bench_seed: int = 0,
-    bench_temperature: float = 1e-9,
+    bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
     bench_spec_gpu_memory_utilization: float = 0.5,
-    example_temperature: float = 1e-9,
+    example_seed: int = 0,
+    example_temperature: float = 0.0,
     example_max_tokens: int = 256,
     example_prompt: str = "write me a longform poem about Pittsburgh. About a page. ",
     example_warmup_base_tokens: int = 8,
@@ -340,6 +343,7 @@ def main(
             bench_main_gpu_memory_utilization,
             bench_spec_max_model_len,
             bench_spec_gpu_memory_utilization,
+            example_seed,
             example_temperature,
             example_max_tokens,
             example_prompt,

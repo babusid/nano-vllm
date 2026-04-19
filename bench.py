@@ -66,19 +66,32 @@ def bench():
         "SHAREGPT_PATH", "ShareGPT_V3_unfiltered_cleaned_split.json"
     )
     num_seqs = int(os.environ.get("BENCH_NUM_SEQS", "256"))
+    print("Num seqs: ", num_seqs)
     max_input_len = int(os.environ.get("BENCH_MAX_INPUT_LEN", "1024"))
+    print("Max input len: ", max_input_len)
     max_output_len = int(os.environ.get("BENCH_MAX_OUTPUT_LEN", "1024"))
+    print("Max output len: ", max_output_len)
     sampling_seed = int(os.environ.get("BENCH_SEED", "0"))
+    print("Sampling seed: ", sampling_seed)
+    random.seed(sampling_seed)
+    torch.manual_seed(sampling_seed)
+    torch.cuda.manual_seed_all(sampling_seed)
     temperature = float(os.environ.get("BENCH_TEMPERATURE", "1e-9"))
+    print("Temperature: ", temperature)
     warmup_seqs = int(os.environ.get("BENCH_WARMUP_SEQS", "32"))
+    print("Warmup seqs: ", warmup_seqs)
     main_max_model_len = int(os.environ.get("BENCH_MAIN_MAX_MODEL_LEN", "4096"))
+    print("Main max model len: ", main_max_model_len)
     main_gpu_memory_utilization = float(
         os.environ.get("BENCH_MAIN_GPU_MEMORY_UTILIZATION", "0.8")
     )
+    print("Main gpu memory utilization: ", main_gpu_memory_utilization)
     spec_max_model_len = int(os.environ.get("BENCH_SPEC_MAX_MODEL_LEN", "4096"))
+    print("Spec max model len: ", spec_max_model_len)
     spec_gpu_memory_utilization = float(
         os.environ.get("BENCH_SPEC_GPU_MEMORY_UTILIZATION", "0.5")
     )
+    print("Spec gpu memory utilization: ", spec_gpu_memory_utilization)
 
     # speculation config comes from env so run_modal.py flags can propagate
     spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
