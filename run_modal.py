@@ -11,6 +11,9 @@ Usage:
     # Run example script (single model)
     modal run run_modal.py --target example
 
+    # Run ARC-Easy accuracy benchmark
+    modal run run_modal.py --target arc
+
     # Run benchmark with naive speculative decoding (default length 1)
     modal run run_modal.py --target bench --spec-mode naive
 
@@ -66,7 +69,10 @@ trace_volume = modal.Volume.from_name(
     "nano-vllm-profiler-traces", create_if_missing=True
 )
 sharegpt_volume = modal.Volume.from_name("nano-vllm-sharegpt", create_if_missing=True)
+arc_volume = modal.Volume.from_name("nano-vllm-arc", create_if_missing=True)
 TRACE_DIR = Path("/traces")
+ARC_DIR = Path("/arc")
+ARC_CACHE_DIR = ARC_DIR / "hf_datasets"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.11")
@@ -79,6 +85,7 @@ image = (
     )
     .pip_install(
         "transformers==4.51.0",
+        "datasets>=2.20.0",
         "huggingface_hub>=0.25.0",
         "xxhash",
         "tiktoken",
@@ -132,6 +139,24 @@ def _download_sharegpt() -> str:
     return SHAREGPT_PATH
 
 
+def _download_arc_easy(cache_dir: Path = ARC_CACHE_DIR) -> str:
+    import os
+    from datasets import load_dataset
+
+    os.makedirs(cache_dir, exist_ok=True)
+    marker = cache_dir / ".arc_easy_test_ready"
+    if not marker.exists():
+        print(f"Downloading ARC-Easy dataset to cache dir {cache_dir} ...")
+        load_dataset(
+            "allenai/ai2_arc", "ARC-Easy", split="test", cache_dir=str(cache_dir)
+        )
+        marker.touch()
+        print("ARC-Easy dataset download complete.")
+    else:
+        print("ARC-Easy dataset already present in cache, skipping download.")
+    return str(cache_dir)
+
+
 @app.function(
     image=image,
     gpu="H200:1",
@@ -140,6 +165,7 @@ def _download_sharegpt() -> str:
         "/root/huggingface": hf_volume,
         str(TRACE_DIR): trace_volume,
         str(SHAREGPT_DIR): sharegpt_volume,
+        str(ARC_DIR): arc_volume,
     },
 )
 def run_target(
@@ -175,14 +201,24 @@ def run_target(
     example_main_gpu_memory_utilization: float = 0.8,
     example_spec_max_model_len: int = 4096,
     example_spec_gpu_memory_utilization: float = 0.5,
+    arc_num_examples: int = 200,
+    arc_warmup_examples: int = 16,
+    arc_seed: int = 0,
+    arc_temperature: float = 1e-9,
+    arc_main_max_model_len: int = 4096,
+    arc_main_gpu_memory_utilization: float = 0.8,
+    arc_spec_max_model_len: int = 4096,
+    arc_spec_gpu_memory_utilization: float = 0.5,
 ) -> None:
     import os
     import runpy
     import sys
     import torch
 
-    if target not in {"bench", "example"}:
-        raise ValueError(f"target must be one of ['bench', 'example'], got {target!r}")
+    if target not in {"bench", "example", "arc"}:
+        raise ValueError(
+            f"target must be one of ['bench', 'example', 'arc'], got {target!r}"
+        )
     spec_mode_norm = spec_mode.lower()
     if spec_mode_norm not in {"none", "naive"}:
         raise ValueError(
@@ -230,7 +266,7 @@ def run_target(
             bench_spec_gpu_memory_utilization
         )
         os.environ["SHAREGPT_PATH"] = _download_sharegpt()
-    else:
+    elif target == "example":
         os.environ["EXAMPLE_SEED"] = str(example_seed)
         os.environ["EXAMPLE_TEMPERATURE"] = str(example_temperature)
         os.environ["EXAMPLE_MAX_TOKENS"] = str(example_max_tokens)
@@ -244,14 +280,29 @@ def run_target(
         os.environ["EXAMPLE_SPEC_GPU_MEMORY_UTILIZATION"] = str(
             example_spec_gpu_memory_utilization
         )
+    else:
+        os.environ["ARC_NUM_EXAMPLES"] = str(arc_num_examples)
+        os.environ["ARC_WARMUP_EXAMPLES"] = str(arc_warmup_examples)
+        os.environ["ARC_SEED"] = str(arc_seed)
+        os.environ["ARC_TEMPERATURE"] = str(arc_temperature)
+        os.environ["ARC_MAIN_MAX_MODEL_LEN"] = str(arc_main_max_model_len)
+        os.environ["ARC_MAIN_GPU_MEMORY_UTILIZATION"] = str(
+            arc_main_gpu_memory_utilization
+        )
+        os.environ["ARC_SPEC_MAX_MODEL_LEN"] = str(arc_spec_max_model_len)
+        os.environ["ARC_SPEC_GPU_MEMORY_UTILIZATION"] = str(
+            arc_spec_gpu_memory_utilization
+        )
+        os.environ["ARC_CACHE_DIR"] = _download_arc_easy()
 
     workspace_dir = "/workspace"
     if workspace_dir not in sys.path:
         sys.path.insert(0, workspace_dir)
 
-    script_path = os.path.join(workspace_dir, f"{target}.py")
+    script_name = "bench_arc.py" if target == "arc" else f"{target}.py"
+    script_path = os.path.join(workspace_dir, script_name)
     if not os.path.isfile(script_path):
-        script_path = f"/{target}.py"
+        script_path = f"/{script_name}"
 
     if not profile:
         runpy.run_path(script_path, run_name="__main__")
@@ -317,6 +368,14 @@ def main(
     example_main_gpu_memory_utilization: float = 0.8,
     example_spec_max_model_len: int = 4096,
     example_spec_gpu_memory_utilization: float = 0.5,
+    arc_num_examples: int = 200,
+    arc_warmup_examples: int = 16,
+    arc_seed: int = 0,
+    arc_temperature: float = 1e-9,
+    arc_main_max_model_len: int = 4096,
+    arc_main_gpu_memory_utilization: float = 0.8,
+    arc_spec_max_model_len: int = 4096,
+    arc_spec_gpu_memory_utilization: float = 0.5,
 ):
     try:
         run_target.remote(
@@ -352,6 +411,14 @@ def main(
             example_main_gpu_memory_utilization,
             example_spec_max_model_len,
             example_spec_gpu_memory_utilization,
+            arc_num_examples,
+            arc_warmup_examples,
+            arc_seed,
+            arc_temperature,
+            arc_main_max_model_len,
+            arc_main_gpu_memory_utilization,
+            arc_spec_max_model_len,
+            arc_spec_gpu_memory_utilization,
         )
     except Exception as exc:  # pragma: no cover
         print(f"Modal execution failed: {exc}")
