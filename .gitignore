@@ -196,3 +196,5 @@ cython_debug/
 
 # Pytorch traces
 traces/
+
+medusa_repo/
