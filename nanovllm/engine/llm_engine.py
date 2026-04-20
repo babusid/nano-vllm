@@ -268,13 +268,14 @@ class LLMEngine:
             with torch.profiler.record_function("base.run"):
                 token_ids, _ = self.model_runners[0].call("run", seqs, is_prefill)
             token_ids = [[tok] for tok in token_ids]
+            step_accepted = len(seqs)
 
         with torch.profiler.record_function("llm.step.postprocess"):
             self.scheduler.postprocess(seqs, token_ids)
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -step_accepted
         # step_drafts/step_accepted are -1 for prefill and non-spec steps so
         # callers can distinguish "no spec this step" from a genuine 0-draft
         # batch. Caller aggregates; see generate() / bench for reporting.
