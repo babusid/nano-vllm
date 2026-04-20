@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import torch
 from nanovllm import LLM, SamplingParams
@@ -8,6 +9,11 @@ from nanovllm.engine.llm_engine import SpeculationMode
 
 
 def example():
+    sampling_seed = int(os.environ.get("EXAMPLE_SEED", "0"))
+    print("Sampling seed: ", sampling_seed)
+    random.seed(sampling_seed)
+    torch.manual_seed(sampling_seed)
+    torch.cuda.manual_seed_all(sampling_seed)
     temperature = float(os.environ.get("EXAMPLE_TEMPERATURE", "1e-9"))
     max_tokens = int(os.environ.get("EXAMPLE_MAX_TOKENS", "256"))
     prompt_text = os.environ.get(
