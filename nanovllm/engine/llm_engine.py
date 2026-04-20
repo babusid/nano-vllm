@@ -51,18 +51,14 @@ class LLMEngine:
         # Mode-specific param validation
         if speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             if speculator_config is None:
-                raise ValueError(
-                    "speculator_config is required for naive speculation"
-                )
+                raise ValueError("speculator_config is required for naive speculation")
             if speculation_length is None or speculation_length < 1:
                 raise ValueError(
                     "speculation_length must be a positive integer for naive speculation"
                 )
         if speculation_mode is SpeculationMode.MEDUSA:
             if medusa_model_path is None:
-                raise ValueError(
-                    "medusa_model_path is required for MEDUSA speculation"
-                )
+                raise ValueError("medusa_model_path is required for MEDUSA speculation")
 
         # Pre-compute static MEDUSA tree buffers once at engine start.
         # These are passed to ModelRunner (for attention / head computation)
@@ -234,11 +230,11 @@ class LLMEngine:
         """
         runner = self.model_runners[0]
         buffers = self.medusa_buffers
-        retrieve_indices = buffers["retrieve_indices"]   # [num_paths, depth+1] CUDA
-        tree_indices     = buffers["tree_indices"]        # [medusa_len] CUDA
-        medusa_len       = buffers["medusa_len"]
-        eos              = self.model_config.eos
-        block_size       = self.model_config.kvcache_block_size
+        retrieve_indices = buffers["retrieve_indices"]  # [num_paths, depth+1] CUDA
+        tree_indices = buffers["tree_indices"]  # [medusa_len] CUDA
+        medusa_len = buffers["medusa_len"]
+        eos = self.model_config.eos
+        block_size = self.model_config.kvcache_block_size
 
         # ---- Prefill ----
         if is_prefill:
@@ -269,21 +265,26 @@ class LLMEngine:
                 "run_medusa_decode_batch",
                 seed_seqs,
                 [s.last_token for s in seed_seqs],
-                [len(s) - 1   for s in seed_seqs],   # seed writes KV at last committed pos
-                [len(s)       for s in seed_seqs],   # context_len = committed length
+                [len(s) - 1 for s in seed_seqs],  # seed writes KV at last committed pos
+                [len(s) for s in seed_seqs],  # context_len = committed length
             )
             # lm_s: [S, V]      head_s: [H, S, V]
             for j, i in enumerate(seed_idx):
-                seqs[i].medusa_lm_logits   = lm_s[j : j + 1].unsqueeze(1)          # [1,1,V]
-                seqs[i].medusa_head_logits = head_s[:, j : j + 1].unsqueeze(2)     # [H,1,1,V]
+                seqs[i].medusa_lm_logits = lm_s[j : j + 1].unsqueeze(1)  # [1,1,V]
+                seqs[i].medusa_head_logits = head_s[:, j : j + 1].unsqueeze(
+                    2
+                )  # [H,1,1,V]
 
         # ── [2] Assemble batched logits stacks ───────────────────────────────
-        lm_stack   = torch.cat([s.medusa_lm_logits   for s in seqs], dim=0)         # [B,1,V]
-        head_stack = torch.cat([s.medusa_head_logits for s in seqs], dim=1)         # [H,B,1,V]
+        lm_stack = torch.cat([s.medusa_lm_logits for s in seqs], dim=0)  # [B,1,V]
+        head_stack = torch.cat([s.medusa_head_logits for s in seqs], dim=1)  # [H,B,1,V]
 
         # ── [3] Batched candidate tree construction ──────────────────────────
         cart_candidates, tree_candidates = generate_candidates(
-            head_stack, lm_stack, tree_indices, retrieve_indices,
+            head_stack,
+            lm_stack,
+            tree_indices,
+            retrieve_indices,
             temperature=temperature,
         )
         # cart_candidates : [B, num_paths, depth+1]
@@ -296,7 +297,7 @@ class LLMEngine:
         lm_logits_b = lm_logits.view(B, medusa_len, V)
 
         # ── [5] Batched posterior evaluation ─────────────────────────────────
-        path_logits = lm_logits_b[:, retrieve_indices]   # [B, num_paths, depth+1, V]
+        path_logits = lm_logits_b[:, retrieve_indices]  # [B, num_paths, depth+1, V]
         best_candidate, accept_length = evaluate_posterior(
             path_logits,
             cart_candidates,
@@ -306,10 +307,10 @@ class LLMEngine:
 
         # ── [6] Batched bonus-token sampling ─────────────────────────────────
         batch_idx = torch.arange(B, device=lm_logits_b.device)
-        accept_nodes = retrieve_indices[best_candidate, accept_length]   # [B]
-        bonus_logits = lm_logits_b[batch_idx, accept_nodes]              # [B, V]
+        accept_nodes = retrieve_indices[best_candidate, accept_length]  # [B]
+        bonus_logits = lm_logits_b[batch_idx, accept_nodes]  # [B, V]
         if temperature == 0:
-            bonus_tokens = bonus_logits.argmax(dim=-1)                   # [B]
+            bonus_tokens = bonus_logits.argmax(dim=-1)  # [B]
         else:
             # fp32 upcast — same overflow concern as generate_candidates /
             # evaluate_posterior: at low temperatures, fp16 logits / temperature
@@ -318,11 +319,11 @@ class LLMEngine:
             bonus_tokens = torch.multinomial(bonus_probs, 1).squeeze(-1)
 
         # ── [7] Gather the accepted cartesian paths (still on GPU) ──────────
-        chosen_paths = cart_candidates[batch_idx, best_candidate]         # [B, depth+1]
+        chosen_paths = cart_candidates[batch_idx, best_candidate]  # [B, depth+1]
 
         # Single GPU→CPU sync for all scheduling decisions this step.
-        best_cand_cpu   = best_candidate.cpu().tolist()
-        accept_len_cpu  = accept_length.cpu().tolist()
+        best_cand_cpu = best_candidate.cpu().tolist()
+        accept_len_cpu = accept_length.cpu().tolist()
         chosen_paths_cpu = chosen_paths.cpu().tolist()
         bonus_tokens_cpu = bonus_tokens.cpu().tolist()
         # retrieve_indices is constant across steps; .cpu() once and cache.
@@ -348,14 +349,18 @@ class LLMEngine:
                     continue
                 src_lp = old + tree_idx
                 dst_lp = old + step
-                src_flat.append(bt[src_lp // block_size] * block_size + src_lp % block_size)
-                dst_flat.append(bt[dst_lp // block_size] * block_size + dst_lp % block_size)
+                src_flat.append(
+                    bt[src_lp // block_size] * block_size + src_lp % block_size
+                )
+                dst_flat.append(
+                    bt[dst_lp // block_size] * block_size + dst_lp % block_size
+                )
         if src_flat:
             runner.call("copy_accepted_kv_slots_batched", src_flat, dst_flat)
 
         # ── Build final per-seq token lists, deciding bonus eligibility ─────
         out_tokens: list[list[int]] = []
-        continuing: list[int] = []       # seq indices that should receive a bonus pass
+        continuing: list[int] = []  # seq indices that should receive a bonus pass
         total_accepted = 0
         for b in range(B):
             accept_len_b = accept_len_cpu[b]
@@ -384,10 +389,12 @@ class LLMEngine:
             )
             # lm_seed: [C, V]      head_seed: [H, C, V]
             for j, i in enumerate(continuing):
-                seqs[i].medusa_lm_logits   = lm_seed[j : j + 1].unsqueeze(1)       # [1,1,V]
-                seqs[i].medusa_head_logits = head_seed[:, j : j + 1].unsqueeze(2)  # [H,1,1,V]
+                seqs[i].medusa_lm_logits = lm_seed[j : j + 1].unsqueeze(1)  # [1,1,V]
+                seqs[i].medusa_head_logits = head_seed[:, j : j + 1].unsqueeze(
+                    2
+                )  # [H,1,1,V]
 
-        step_drafts   = B * (medusa_len - 1)
+        step_drafts = B * (medusa_len - 1)
         step_accepted = total_accepted
         return out_tokens, step_drafts, step_accepted
 
@@ -498,19 +505,14 @@ class LLMEngine:
             with torch.profiler.record_function("base.run"):
                 token_ids, _ = self.model_runners[0].call("run", seqs, is_prefill)
             token_ids = [[tok] for tok in token_ids]
+            step_accepted = len(seqs)
 
         with torch.profiler.record_function("llm.step.postprocess"):
             self.scheduler.postprocess(seqs, token_ids)
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
-        # For MEDUSA decode, report the actual number of tokens committed this
-        # step (root + accepted speculative + bonus) rather than just -1 per seq,
-        # so that the throughput display in generate() reflects real token rate.
-        if self.speculation_mode is SpeculationMode.MEDUSA and not is_prefill:
-            num_tokens = -sum(len(tids) for tids in token_ids)
-        else:
-            num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -step_accepted
         # step_drafts/step_accepted are -1 for prefill and non-spec steps so
         # callers can distinguish "no spec this step" from a genuine 0-draft
         # batch. Caller aggregates; see generate() / bench for reporting.
