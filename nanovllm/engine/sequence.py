@@ -1,6 +1,9 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from typing import Optional
+
+import torch
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -53,6 +56,13 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+        # MEDUSA per-sequence state — only populated in MEDUSA mode.
+        # Holds logits at the last accepted token position so that
+        # generate_candidates can build the next step's tree candidates.
+        # Shape: [vocab_size] for lm, [num_medusa_heads, vocab_size] for heads.
+        self.medusa_lm_logits: Optional[torch.Tensor] = None
+        self.medusa_head_logits: Optional[torch.Tensor] = None
 
     @property
     def block_tables(self) -> list[list[int]]:

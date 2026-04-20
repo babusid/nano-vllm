@@ -14,19 +14,26 @@ class Scheduler:
         speculation_mode: SpeculationMode = SpeculationMode.NONE,
         speculator_config: list[Config] | None = None,
         speculation_length: int | None = None,
+        medusa_len: int | None = None,
     ):
         self.speculation_mode = speculation_mode
         self.speculator_config = speculator_config
         self.speculation_length = speculation_length
-        _spec_conf = [
-            self.speculation_mode is not SpeculationMode.NONE,
-            self.speculator_config,
-            self.speculation_length,
-        ]
-        if any(_spec_conf) and not all(_spec_conf):
-            raise ValueError(
-                "Speculation mode, speculator config and speculation length must be specified together"
-            )
+        self.medusa_len = medusa_len
+
+        # Naive spec-dec requires both a speculator config and a draft length.
+        # MEDUSA mode uses neither (it has no separate draft model).
+        if speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            if not speculator_config or not speculation_length:
+                raise ValueError(
+                    "Speculation mode, speculator config and speculation length "
+                    "must be specified together for naive speculation"
+                )
+        if speculation_mode is SpeculationMode.MEDUSA:
+            if not medusa_len:
+                raise ValueError(
+                    "medusa_len must be provided when using MEDUSA speculation mode"
+                )
 
         self.max_num_seqs = config.max_num_seqs  # batch size in sequences
         self.max_num_batched_tokens = (
@@ -107,9 +114,19 @@ class Scheduler:
             # add 1 to the speculation length to account for the bonus token
             # from the verifier
             speculation_tokens = self.speculation_length + 1
-            # speculation_tokens = self.speculation_length
+        elif self.speculation_mode is SpeculationMode.MEDUSA:
+            # reserve medusa_len slots: one for each tree candidate position
+            speculation_tokens = self.medusa_len
 
-        while self.running and num_seqs < self.max_num_seqs:
+        # MEDUSA tree-decode is inherently single-sequence: the tree attention
+        # mask is pre-computed for a single request.  Cap the decode batch to 1.
+        decode_max_seqs = (
+            1
+            if self.speculation_mode is SpeculationMode.MEDUSA
+            else self.max_num_seqs
+        )
+
+        while self.running and num_seqs < decode_max_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
             bonus_tokens = min(  # make sure the bonus tokens aren't more than the remaining context
                 speculation_tokens,

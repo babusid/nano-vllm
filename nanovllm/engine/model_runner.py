@@ -1,6 +1,8 @@
 from ntpath import expanduser
+import os
 import pickle
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -8,6 +10,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.medusa_utils import ResBlock
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.vicuna import VicunaForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -36,6 +39,11 @@ class ModelRunner:
         block_managers: list[BlockManager] | None = None,
         model_runner_idx: int = 0,
         verify_seqlen_q: int | None = None,
+        # MEDUSA-specific params — all None/0 for non-MEDUSA runners
+        medusa_model_path: str | None = None,
+        medusa_num_heads: int = 0,
+        medusa_num_layers: int = 1,
+        medusa_buffers: dict | None = None,
     ):
         self.config = config
         self.block_managers = block_managers if block_managers is not None else []
@@ -45,6 +53,10 @@ class ModelRunner:
         # bs * verify_seqlen_q query tokens so verify() can replay instead of
         # running eagerly. Only the verifier runner needs this.
         self.verify_seqlen_q = verify_seqlen_q
+        # MEDUSA state (None when not in MEDUSA mode)
+        self.medusa_buffers = medusa_buffers
+        self.medusa_tree_mask = medusa_buffers["medusa_attn_mask"] if medusa_buffers else None
+        self.medusa_len = medusa_buffers["medusa_len"] if medusa_buffers else 0
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -78,6 +90,25 @@ class ModelRunner:
                 "nano-vllm supports qwen3 and llama (e.g. Vicuna) checkpoints."
             )
         load_model(self.model, config.model)
+
+        # Load MEDUSA heads alongside the base model weights when in MEDUSA mode.
+        # Each head is medusa_num_layers ResBlocks followed by a linear projection
+        # to vocab_size. Weights are read from medusa_lm_head.pt in the checkpoint.
+        if medusa_model_path:
+            hidden_size = hf_config.hidden_size
+            vocab_size = hf_config.vocab_size
+            self.medusa_heads = nn.ModuleList([
+                nn.Sequential(
+                    *[ResBlock(hidden_size) for _ in range(medusa_num_layers)],
+                    nn.Linear(hidden_size, vocab_size, bias=False),
+                )
+                for _ in range(medusa_num_heads)
+            ])
+            head_ckpt = os.path.join(medusa_model_path, "medusa_lm_head.pt")
+            state = torch.load(head_ckpt, map_location="cuda")
+            self.medusa_heads.load_state_dict(state, strict=False)
+            self.medusa_heads.eval()
+
         if model_type == "qwen3":
             self.sampler = Qwen3Sampler()
         elif model_type == "llama":
@@ -87,9 +118,14 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
-            self.capture_cudagraph()
-            if self.verify_seqlen_q is not None and self.verify_seqlen_q > 1:
-                self.capture_verify_cudagraph()
+            if not medusa_model_path:
+                # Standard decode + optional verify graphs (none/naive modes)
+                self.capture_cudagraph()
+                if self.verify_seqlen_q is not None and self.verify_seqlen_q > 1:
+                    self.capture_verify_cudagraph()
+            else:
+                # MEDUSA mode: single tree-decode graph, no regular decode graph
+                self.capture_medusa_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -109,9 +145,12 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            if hasattr(self, "graphs"):
+                del self.graphs, self.graph_pool
             if hasattr(self, "verify_graphs"):
                 del self.verify_graphs
+            if hasattr(self, "medusa_graph"):
+                del self.medusa_graph, self.medusa_graph_vars
         torch.cuda.synchronize()
         if self._owns_process_group and dist.is_initialized():
             dist.destroy_process_group()
@@ -618,4 +657,173 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+        )
+
+    # ------------------------------------------------------------------
+    # MEDUSA tree-decode methods
+    # ------------------------------------------------------------------
+
+    def prepare_medusa_tree(
+        self, seqs: list, tree_candidates_map: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build input tensors for one MEDUSA tree-decode step (batch size = 1).
+
+        The scheduler has pre-reserved medusa_len extra KV slots per sequence,
+        so we can safely write tree-candidate K/V there.  prefix_lens is set
+        to the committed length so the prefix FA call ignores those slots.
+        """
+        assert len(seqs) == 1, "MEDUSA tree decode requires batch size 1"
+        seq = seqs[0]
+        block_table = self._block_table(seq)
+        committed_len = len(seq)
+        medusa_len = self.medusa_len
+
+        # generate_candidates returns [1, medusa_len]; flatten to 1-D so it
+        # matches the flat input_ids layout used everywhere in ModelRunner.
+        tree_tokens = tree_candidates_map[seq.seq_id].view(-1)  # [medusa_len], on CUDA
+
+        # RoPE positions: root at committed_len, depth-d nodes at committed_len+d
+        medusa_position_ids = self.medusa_buffers["medusa_position_ids"]  # [medusa_len]
+        positions = committed_len + medusa_position_ids  # [medusa_len], CUDA
+
+        # One paged-KV slot per tree node in the reserved region
+        slot_list = []
+        for i in range(medusa_len):
+            token_idx = committed_len + i
+            slot_list.append(
+                block_table[token_idx // self.block_size] * self.block_size
+                + token_idx % self.block_size
+            )
+        slot_mapping = torch.tensor(
+            slot_list, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        prefix_lens = torch.tensor(
+            [committed_len], dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        max_bt_len = max(len(block_table), 1)
+        block_tables = torch.tensor(
+            [block_table + [-1] * (max_bt_len - len(block_table))],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=prefix_lens,   # not used in tree path but kept for consistency
+            block_tables=block_tables,
+            is_medusa_tree_decode=True,
+            medusa_tree_mask=self.medusa_tree_mask,
+            prefix_lens=prefix_lens,
+        )
+        return tree_tokens, positions
+
+    @torch.inference_mode()
+    def run_medusa_tree(
+        self, seqs: list, tree_candidates_map: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one MEDUSA tree-decode step.
+
+        Returns:
+            lm_logits:    [medusa_len, vocab_size]
+            medusa_logits:[num_medusa_heads, medusa_len, vocab_size]
+        """
+        input_ids, positions = self.prepare_medusa_tree(seqs, tree_candidates_map)
+        hidden = self._run_medusa_graph(input_ids, positions)
+        lm_logits = self.model.compute_logits(hidden)
+        medusa_logits = torch.stack(
+            [head(hidden) for head in self.medusa_heads], dim=0
+        )
+        reset_context()
+        return lm_logits, medusa_logits
+
+    @torch.inference_mode()
+    def _run_medusa_graph(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the model forward for tree decode, replaying the CUDA graph when possible."""
+        if self.enforce_eager or not hasattr(self, "medusa_graph"):
+            return self.model(input_ids, positions)
+
+        context = get_context()
+        gv = self.medusa_graph_vars
+        # Copy live values into the pre-allocated graph-vars tensors
+        # (these are the exact GPU buffers the captured graph reads from).
+        gv["input_ids"][:] = input_ids
+        gv["positions"][:] = positions
+        gv["slot_mapping"][:] = context.slot_mapping
+        gv["prefix_lens"][:] = context.prefix_lens
+        bt = context.block_tables          # [1, actual_num_blocks]
+        gv["block_tables"].zero_()
+        gv["block_tables"][:1, : bt.size(1)] = bt
+
+        # Re-point context to the graph-vars buffers so the replayed graph
+        # reads from the same memory addresses it captured.
+        set_context(
+            False,
+            slot_mapping=gv["slot_mapping"],
+            context_lens=gv["prefix_lens"],
+            block_tables=gv["block_tables"],
+            is_medusa_tree_decode=True,
+            medusa_tree_mask=self.medusa_tree_mask,
+            prefix_lens=gv["prefix_lens"],
+        )
+        self.medusa_graph.replay()
+        return gv["hidden_outputs"][:]
+
+    @torch.inference_mode()
+    def capture_medusa_cudagraph(self):
+        """Capture a single CUDA graph for the MEDUSA tree-decode forward pass.
+
+        Fixed shape: [medusa_len] input tokens, batch size 1.  The graph covers
+        only the transformer forward (model.__call__); compute_logits and the
+        MEDUSA heads run eagerly after replay — they're cheap linear layers.
+        """
+        config = self.config
+        hf_config = config.hf_config
+        medusa_len = self.medusa_len
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        input_ids = torch.zeros(medusa_len, dtype=torch.int64)
+        positions = torch.zeros(medusa_len, dtype=torch.int64)
+        slot_mapping = torch.full((medusa_len,), -1, dtype=torch.int32)
+        prefix_lens = torch.zeros(1, dtype=torch.int32)
+        block_tables = torch.zeros(1, max_num_blocks, dtype=torch.int32)
+        hidden_outputs = torch.zeros(medusa_len, hf_config.hidden_size)
+
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=prefix_lens,
+            block_tables=block_tables,
+            is_medusa_tree_decode=True,
+            medusa_tree_mask=self.medusa_tree_mask,
+            prefix_lens=prefix_lens,
+        )
+
+        # Two warmup runs to let CUDA allocate any lazy buffers before capture.
+        for _ in range(2):
+            hidden_outputs[:] = self.model(input_ids, positions)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        pool = getattr(self, "graph_pool", None)
+        with torch.cuda.graph(graph, pool):
+            hidden_outputs[:] = self.model(input_ids, positions)
+        if pool is None:
+            self.graph_pool = graph.pool()
+
+        torch.cuda.synchronize()
+        reset_context()
+
+        self.medusa_graph = graph
+        self.medusa_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            prefix_lens=prefix_lens,
+            block_tables=block_tables,
+            hidden_outputs=hidden_outputs,
         )
