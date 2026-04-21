@@ -14,6 +14,12 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.speculation import SpeculationMode
+from nanovllm.engine.medusa_utils import (
+    generate_medusa_buffers,
+    generate_candidates,
+    evaluate_posterior,
+    mc_sim_7b_63,
+)
 
 
 class LLMEngine:
@@ -23,30 +29,61 @@ class LLMEngine:
         speculation_mode: SpeculationMode = SpeculationMode.NONE,
         speculator_config: list[Config] | None = None,
         speculation_length: int | None = None,
+        # MEDUSA-specific params — ignored in none/naive modes
+        medusa_model_path: str | None = None,
+        medusa_choices: list | None = None,
+        medusa_num_heads: int = 4,
+        medusa_num_layers: int = 1,
         **kwargs,
     ):
         self.speculation_mode = speculation_mode
         self.model_config = model_config
         self.speculator_config = speculator_config
         self.speculation_length = speculation_length
-        # tensor parallelism bookkeeping
-        # disable TP with specdecode for now
+
+        # tensor parallelism bookkeeping — TP not supported with any spec-dec mode
         if (
             speculation_mode is not SpeculationMode.NONE
             and model_config.tensor_parallel_size > 1
         ):
             raise NotImplementedError("Speculation not supported with TP")
 
-        if speculation_mode is not SpeculationMode.NONE and speculator_config is None:
-            raise ValueError(
-                "Speculator config and model is required for naive speculation"
-            )
-        if speculation_mode is not SpeculationMode.NONE and (
-            speculation_length is None or speculation_length < 1
-        ):
-            raise ValueError(
-                "Speculation length must be a positive integer for speculation"
-            )
+        # Mode-specific param validation
+        if speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            if speculator_config is None:
+                raise ValueError(
+                    "speculator_config is required for naive speculation"
+                )
+            if speculation_length is None or speculation_length < 1:
+                raise ValueError(
+                    "speculation_length must be a positive integer for naive speculation"
+                )
+        if speculation_mode is SpeculationMode.MEDUSA:
+            if medusa_model_path is None:
+                raise ValueError(
+                    "medusa_model_path is required for MEDUSA speculation"
+                )
+
+        # Pre-compute static MEDUSA tree buffers once at engine start.
+        # These are passed to ModelRunner (for attention / head computation)
+        # and Scheduler (for KV slot reservation).
+        medusa_buffers: dict | None = None
+        if speculation_mode is SpeculationMode.MEDUSA:
+            choices = medusa_choices if medusa_choices is not None else mc_sim_7b_63
+            # Clip the tree to paths compatible with the available number of heads.
+            # At depth d (path length d), generate_candidates maps those nodes to
+            # flat-candidate indices  cur[-1] + TOPK * (d-1) + 1.  The flat vector
+            # has size 1 + num_heads * TOPK, so valid depths are 1..num_heads only.
+            # Paths longer than num_heads would produce out-of-range indices and
+            # cause CUDA index-out-of-bounds assertions at runtime.
+            choices = [c for c in choices if len(c) <= medusa_num_heads]
+            if not choices:
+                raise ValueError(
+                    f"No valid medusa_choices for medusa_num_heads={medusa_num_heads}. "
+                    "All paths in the topology exceed the number of heads."
+                )
+            medusa_buffers = generate_medusa_buffers(choices, device="cuda")
+        self.medusa_buffers = medusa_buffers
 
         self.block_managers: list[BlockManager] = []
         self.model_runners: list[ModelRunner] = []
@@ -90,11 +127,12 @@ class LLMEngine:
                 event=self.events,
                 block_managers=self.block_managers,
                 model_runner_idx=0,
-                verify_seqlen_q=(
-                    verify_seqlen_q
-                    if speculation_mode is not SpeculationMode.NONE
-                    else None
-                ),
+                verify_seqlen_q=verify_seqlen_q,
+                # MEDUSA params (all None/0 in non-MEDUSA modes)
+                medusa_model_path=medusa_model_path,
+                medusa_num_heads=medusa_num_heads,
+                medusa_num_layers=medusa_num_layers,
+                medusa_buffers=medusa_buffers,
             )
         )
 
@@ -138,9 +176,10 @@ class LLMEngine:
             speculation_mode=self.speculation_mode,
             speculator_config=self.speculator_config,
             speculation_length=self.speculation_length,
+            medusa_len=medusa_buffers["medusa_len"] if medusa_buffers else None,
         )
 
-        # running acceptance stats for naive speculation
+        # running acceptance stats for spec-dec modes
         self.spec_drafts_total = 0
         self.spec_accepted_total = 0
 
@@ -167,12 +206,120 @@ class LLMEngine:
         # todo; split the step method into dispatch pattern
         pass
 
+    # ------------------------------------------------------------------
+    # MEDUSA step logic
+    # ------------------------------------------------------------------
+
+    def _medusa_step(
+        self, seqs: list[Sequence], is_prefill: bool
+    ) -> tuple[list[list[int]], int, int]:
+        """Execute one MEDUSA engine step.
+
+        Returns
+        -------
+        token_ids      : list[list[int]]  — new tokens per sequence (for postprocess)
+        step_drafts    : int              — speculative candidates tried (-1 for prefill)
+        step_accepted  : int              — speculative tokens accepted (-1 for prefill)
+        """
+        runner = self.model_runners[0]
+        buffers = self.medusa_buffers
+        retrieve_indices = buffers["retrieve_indices"]  # [num_paths, depth+1]
+        tree_indices = buffers["tree_indices"]          # [medusa_len]
+
+        # ---- Prefill ----
+        if is_prefill:
+            token_ids, _ = runner.call("run", seqs, True)
+            # Clear MEDUSA logits so the first decode step triggers the seed pass.
+            for seq in seqs:
+                seq.medusa_lm_logits = None
+                seq.medusa_head_logits = None
+            return [[tok] for tok in token_ids], -1, -1
+
+        # ---- Decode (batch size is always 1 in MEDUSA mode) ----
+        assert len(seqs) == 1, "MEDUSA decode requires batch size 1"
+        seq = seqs[0]
+
+        # Seed pass: runs once after each prefill.
+        # Writes the first generated token's KV to the paged cache and computes
+        # LM + MEDUSA-head logits at that position so candidate generation works.
+        if seq.medusa_lm_logits is None:
+            seed_start = len(seq) - 1   # logical position of the last committed token
+            lm_s, med_s = runner.call(
+                "run_medusa_kv_and_seed", seq, [seq.last_token], seed_start
+            )
+            seq.medusa_lm_logits = lm_s.reshape(1, 1, -1)
+            seq.medusa_head_logits = med_s.reshape(-1, 1, 1, lm_s.shape[-1])
+
+        # Build the candidate tree from stored per-position logits.
+        cart_candidates, tree_candidates = generate_candidates(
+            seq.medusa_head_logits,
+            seq.medusa_lm_logits,
+            tree_indices,
+            retrieve_indices,
+            temperature=seq.temperature,
+        )
+        # cart_candidates : [num_paths, depth+1]   cartesian paths
+        # tree_candidates : [1, medusa_len]         flat tree layout
+
+        # Run all medusa_len tree candidates through the model in one pass.
+        lm_logits, _ = runner.call(
+            "run_medusa_tree", seqs, {seq.seq_id: tree_candidates}
+        )
+        # lm_logits : [medusa_len, vocab]
+
+        # Posterior evaluation: find the best accepted path.
+        path_logits = lm_logits[retrieve_indices]   # [num_paths, depth+1, vocab]
+        best_candidate, accept_length = evaluate_posterior(
+            path_logits,
+            cart_candidates,
+            temperature=seq.temperature,
+        )
+
+        # Accepted tokens: root (position 0 in path) + accept_length speculative.
+        accepted = cart_candidates[best_candidate, : accept_length + 1].tolist()
+
+        # Bonus token: greedy / sampled from the model's prediction at the last
+        # accepted tree position.  Becomes the root of the next step's tree.
+        accept_node = int(retrieve_indices[best_candidate, accept_length])
+        if seq.temperature == 0:
+            bonus = int(lm_logits[accept_node].argmax())
+        else:
+            bonus = int(
+                (lm_logits[accept_node] / seq.temperature)
+                .softmax(dim=-1)
+                .multinomial(1)
+            )
+
+        all_new_tokens = accepted + [bonus]
+        old_committed = len(seq)    # position where the new tokens start
+
+        # Corrective KV pass: re-run the model on the accepted path so that
+        # the paged cache has correct sequential K/V for every new position.
+        # Also returns seed logits for the next tree-decode step.
+        lm_seed, med_seed = runner.call(
+            "run_medusa_kv_and_seed", seq, all_new_tokens, old_committed
+        )
+        seq.medusa_lm_logits = lm_seed.reshape(1, 1, -1)
+        seq.medusa_head_logits = med_seed.reshape(-1, 1, 1, lm_seed.shape[-1])
+
+        # step_drafts = speculative candidates (all tree positions minus root)
+        # step_accepted = verified speculative tokens
+        step_drafts = buffers["medusa_len"] - 1
+        step_accepted = accept_length
+        return [all_new_tokens], step_drafts, step_accepted
+
     def step(self):
         with torch.profiler.record_function("llm.step.schedule"):
             seqs, is_prefill = self.scheduler.schedule()
-        # TODO: gate behavior base don speculation mode
         step_drafts = step_accepted = -1
-        if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+
+        if self.speculation_mode is SpeculationMode.MEDUSA:
+            with torch.profiler.record_function("medusa.step"):
+                token_ids, step_drafts, step_accepted = self._medusa_step(
+                    seqs, is_prefill
+                )
+
+        elif self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             # get the two model runners for regular specdec
             verifier_model_idx = 0
             drafter_model_idx = 1
@@ -274,7 +421,13 @@ class LLMEngine:
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        # For MEDUSA decode, report the actual number of tokens committed this
+        # step (root + accepted speculative + bonus) rather than just -1 per seq,
+        # so that the throughput display in generate() reflects real token rate.
+        if self.speculation_mode is SpeculationMode.MEDUSA and not is_prefill:
+            num_tokens = -sum(len(tids) for tids in token_ids)
+        else:
+            num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         # step_drafts/step_accepted are -1 for prefill and non-spec steps so
         # callers can distinguish "no spec this step" from a genuine 0-draft
         # batch. Caller aggregates; see generate() / bench for reporting.

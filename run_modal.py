@@ -20,6 +20,9 @@ Usage:
     # Run benchmark with naive speculation, length 8
     modal run run_modal.py --target bench --spec-mode naive --spec-length 8
 
+    # Run benchmark with MEDUSA speculative decoding
+    modal run run_modal.py --target bench --spec-mode medusa --medusa-model "FasterDecoding/medusa-vicuna-7b-v1.3"
+
     # Run benchmark with custom models
     modal run run_modal.py --target bench --main-model "Qwen/Qwen3-8B" --spec-model "Qwen/Qwen3-0.6B"
 
@@ -176,6 +179,12 @@ def run_target(
     spec_revision: str = "",
     spec_mode: str = "none",
     spec_length: int = 1,
+    # MEDUSA-specific
+    medusa_model: str = "",
+    medusa_revision: str = "",
+    medusa_choices: str = "",
+    medusa_num_heads: int = 4,
+    medusa_num_layers: int = 1,
     profile: bool = False,
     profile_label: str = "",
     profile_record_shapes: bool = True,
@@ -220,12 +229,14 @@ def run_target(
             f"target must be one of ['bench', 'example', 'arc'], got {target!r}"
         )
     spec_mode_norm = spec_mode.lower()
-    if spec_mode_norm not in {"none", "naive"}:
+    if spec_mode_norm not in {"none", "naive", "medusa"}:
         raise ValueError(
-            f"spec_mode must be one of ['none', 'naive'], got {spec_mode!r}"
+            f"spec_mode must be one of ['none', 'naive', 'medusa'], got {spec_mode!r}"
         )
     if spec_length < 1:
         raise ValueError(f"spec_length must be >= 1, got {spec_length}")
+    if spec_mode_norm == "medusa" and not medusa_model:
+        raise ValueError("--medusa-model is required when --spec-mode medusa")
     # if profile and profile_with_stack and not enforce_eager:
     #     print(
     #         "Profiler warning: disabling --profile-with-stack in CUDA graph mode "
@@ -235,16 +246,23 @@ def run_target(
     #     profile_with_stack = False
 
     print("Target: ", target)
-    print(f"Spec: mode={spec_mode_norm} length={spec_length}")
+    print(f"Spec: mode={spec_mode_norm} length={spec_length if spec_mode_norm == 'naive' else '-'}")
     print(f"Profiler: enabled={profile}")
     print(f"Enforce eager: {enforce_eager}")
 
     main_repo = main_model or "Qwen/Qwen3-8B"
     os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
-    # only pull the speculator when we're actually going to use it
-    if spec_mode_norm != "none":
+
+    # Pull the speculator / MEDUSA checkpoint only when needed.
+    if spec_mode_norm == "naive":
         spec_repo = spec_model or "Qwen/Qwen3-0.6B"
         os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    elif spec_mode_norm == "medusa":
+        os.environ["MEDUSA_MODEL_PATH"] = _download_model(medusa_model, medusa_revision)
+        if medusa_choices:
+            os.environ["MEDUSA_CHOICES"] = medusa_choices
+        os.environ["MEDUSA_NUM_HEADS"] = str(medusa_num_heads)
+        os.environ["MEDUSA_NUM_LAYERS"] = str(medusa_num_layers)
 
     # propagate spec config to the target script via env
     os.environ["SPEC_MODE"] = spec_mode_norm
@@ -343,6 +361,12 @@ def main(
     spec_revision: str = "",
     spec_mode: str = "none",
     spec_length: int = 1,
+    # MEDUSA-specific
+    medusa_model: str = "",
+    medusa_revision: str = "",
+    medusa_choices: str = "",
+    medusa_num_heads: int = 4,
+    medusa_num_layers: int = 1,
     profile: bool = False,
     profile_label: str = "",
     profile_record_shapes: bool = True,
@@ -386,6 +410,11 @@ def main(
             spec_revision,
             spec_mode,
             spec_length,
+            medusa_model,
+            medusa_revision,
+            medusa_choices,
+            medusa_num_heads,
+            medusa_num_layers,
             profile,
             profile_label,
             profile_record_shapes,

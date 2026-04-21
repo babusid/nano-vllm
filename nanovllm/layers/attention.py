@@ -213,5 +213,8 @@ class Attention(nn.Module):
         out_p_h = out_p.permute(1, 0, 2)                        # [num_heads, medusa_len, head_dim]
         out_combined = w_p * out_p_h + w_t * out_t              # [num_heads, medusa_len, head_dim]
 
-        # Return [medusa_len, num_heads, head_dim]
-        return out_combined.permute(1, 0, 2).contiguous()
+        # Cast back to the original query dtype (e.g. float16) before returning.
+        # w_p / w_t are computed in float32 for numerical stability, which
+        # promotes the combined output; without this cast, o_proj (float16
+        # weights) raises a dtype mismatch.
+        return out_combined.to(q.dtype).permute(1, 0, 2).contiguous()

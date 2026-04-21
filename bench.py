@@ -96,8 +96,9 @@ def bench():
     # speculation config comes from env so run_modal.py flags can propagate
     spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
     spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
-    use_spec = spec_mode_str == "naive"
-    print(f"Spec: mode={spec_mode_str} length={spec_length if use_spec else '-'}")
+    use_naive = spec_mode_str == "naive"
+    use_medusa = spec_mode_str == "medusa"
+    print(f"Spec: mode={spec_mode_str} length={spec_length if use_naive else '-'}")
 
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
@@ -112,11 +113,11 @@ def bench():
     )
     print("Main Model Path: ", main_model_path)
 
-    # only construct the speculator config when naive spec is requested —
+    # only construct the speculator config when a spec mode is requested —
     # Config.__post_init__ hits the filesystem / HF cache, so skipping it
     # lets non-spec runs work without a speculator model present
     spec_kwargs = {}
-    if use_spec:
+    if use_naive:
         small_model_path = os.path.expanduser(
             os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
         )
@@ -131,6 +132,27 @@ def bench():
             speculation_mode=SpeculationMode.NAIVE_SPECULATION,
             speculator_config=[small_model_config],
             speculation_length=spec_length,
+        )
+    elif use_medusa:
+        import json as _json
+        medusa_model_path = os.path.expanduser(
+            os.environ.get("MEDUSA_MODEL_PATH", "")
+        )
+        if not medusa_model_path:
+            raise ValueError(
+                "MEDUSA_MODEL_PATH env var must be set when SPEC_MODE=medusa"
+            )
+        medusa_choices_str = os.environ.get("MEDUSA_CHOICES", "")
+        medusa_choices = _json.loads(medusa_choices_str) if medusa_choices_str else None
+        medusa_num_heads = int(os.environ.get("MEDUSA_NUM_HEADS", "4"))
+        medusa_num_layers = int(os.environ.get("MEDUSA_NUM_LAYERS", "1"))
+        print("MEDUSA Model Path: ", medusa_model_path)
+        spec_kwargs = dict(
+            speculation_mode=SpeculationMode.MEDUSA,
+            medusa_model_path=medusa_model_path,
+            medusa_choices=medusa_choices,
+            medusa_num_heads=medusa_num_heads,
+            medusa_num_layers=medusa_num_layers,
         )
 
     print("Initializing LLM...")

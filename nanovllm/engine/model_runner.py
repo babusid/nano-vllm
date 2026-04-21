@@ -740,6 +740,84 @@ class ModelRunner:
         return lm_logits, medusa_logits
 
     @torch.inference_mode()
+    def run_medusa_kv_and_seed(
+        self,
+        seq: "Sequence",
+        new_tokens: list[int],
+        start_pos: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write correct sequential KV for new_tokens and return seed logits.
+
+        This serves two purposes:
+          1. *Corrective pass* (after tree-decode acceptance): the tree wrote KV
+             for accepted positions into non-sequential slots determined by tree
+             layout.  Re-running the model on the accepted path places correct
+             K/V at the sequential logical positions start_pos..start_pos+n-1,
+             which prefix-attention in the next tree step will read.
+          2. *Seed pass* (first decode step after prefill): writes the K/V for
+             the first generated token (at start_pos = len(seq) - 1) and obtains
+             LM + MEDUSA-head logits needed to build the first candidate tree.
+
+        Args:
+            seq:        The sequence (already updated with all committed tokens).
+            new_tokens: Tokens to be placed at positions start_pos..start_pos+n-1.
+            start_pos:  Logical position of the first new token in new_tokens.
+
+        Returns:
+            lm_logits:     [vocab_size]       — LM-head output at last new position.
+            medusa_logits: [num_heads, vocab] — MEDUSA-head outputs at last position.
+        """
+        n = len(new_tokens)
+        block_table = self._block_table(seq)
+
+        input_ids = torch.tensor(
+            new_tokens, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        positions = torch.arange(
+            start_pos, start_pos + n, dtype=torch.int64
+        ).cuda(non_blocking=True)
+
+        slot_list = [
+            block_table[(start_pos + i) // self.block_size] * self.block_size
+            + (start_pos + i) % self.block_size
+            for i in range(n)
+        ]
+        slot_mapping = torch.tensor(
+            slot_list, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        # context_lens = total KV positions seen by the LAST query token.
+        # flash_attn_with_kvcache with causal=True correctly handles seqlen_q > 1:
+        # query i attends to 0..context_lens-n+i (the committed prefix + prior
+        # queries in this group), matching standard autoregressive semantics.
+        context_lens = torch.tensor(
+            [start_pos + n], dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        max_bt_len = max(len(block_table), 1)
+        block_tables_t = torch.tensor(
+            [block_table + [-1] * (max_bt_len - len(block_table))],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables_t,
+        )
+        hidden = self.model(input_ids, positions)   # [n, hidden_size]
+        reset_context()
+
+        last_hidden = hidden[-1:]                   # [1, hidden_size]
+        lm_logits = self.model.compute_logits(last_hidden).squeeze(0)   # [vocab]
+        medusa_logits = torch.stack(
+            [head(last_hidden).squeeze(0) for head in self.medusa_heads], dim=0
+        )  # [num_heads, vocab]
+        return lm_logits, medusa_logits
+
+    @torch.inference_mode()
     def _run_medusa_graph(
         self, input_ids: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
