@@ -239,13 +239,13 @@ class LLMEngine:
         assert len(seqs) == 1, "MEDUSA decode requires batch size 1"
         seq = seqs[0]
 
-        # Seed pass: runs once after each prefill.
-        # Writes the first generated token's KV to the paged cache and computes
-        # LM + MEDUSA-head logits at that position so candidate generation works.
+        # Seed pass (first decode step after each prefill): write the first
+        # generated token's KV using the bonus CUDA graph, then get LM +
+        # MEDUSA-head logits to seed the first candidate tree.
         if seq.medusa_lm_logits is None:
-            seed_start = len(seq) - 1   # logical position of the last committed token
+            seed_pos = len(seq) - 1          # logical position of last committed token
             lm_s, med_s = runner.call(
-                "run_medusa_kv_and_seed", seq, [seq.last_token], seed_start
+                "run_medusa_bonus", seq, seq.last_token, seed_pos, len(seq)
             )
             seq.medusa_lm_logits = lm_s.reshape(1, 1, -1)
             seq.medusa_head_logits = med_s.reshape(-1, 1, 1, lm_s.shape[-1])
@@ -278,8 +278,7 @@ class LLMEngine:
         # Accepted tokens: root (position 0 in path) + accept_length speculative.
         accepted = cart_candidates[best_candidate, : accept_length + 1].tolist()
 
-        # Bonus token: greedy / sampled from the model's prediction at the last
-        # accepted tree position.  Becomes the root of the next step's tree.
+        # Bonus token: sampled from the model's prediction at the last accepted node.
         accept_node = int(retrieve_indices[best_candidate, accept_length])
         if seq.temperature == 0:
             bonus = int(lm_logits[accept_node].argmax())
@@ -290,17 +289,42 @@ class LLMEngine:
                 .multinomial(1)
             )
 
-        all_new_tokens = accepted + [bonus]
         old_committed = len(seq)    # position where the new tokens start
 
-        # Corrective KV pass: re-run the model on the accepted path so that
-        # the paged cache has correct sequential K/V for every new position.
-        # Also returns seed logits for the next tree-decode step.
-        lm_seed, med_seed = runner.call(
-            "run_medusa_kv_and_seed", seq, all_new_tokens, old_committed
+        # Check for EOS in the accepted path. If found, we skip the bonus pass
+        # entirely — the sequence is about to finish and the bonus token would be
+        # a spurious token generated after EOS that inflates total token counts.
+        eos = self.model_config.eos
+        eos_in_accepted = eos in accepted
+
+        # K/V copy: tree node i was stored at slot old_committed+i (unique).
+        # The accepted path's nodes need to be at sequential slots
+        # old_committed+0, old_committed+1, ... before the next prefix-attention.
+        # We copy directly in the kv_cache tensor — no model re-run needed.
+        accepted_tree_nodes = retrieve_indices[best_candidate, : accept_length + 1].tolist()
+        runner.call(
+            "copy_accepted_kv_slots", seq, accepted_tree_nodes, old_committed
         )
-        seq.medusa_lm_logits = lm_seed.reshape(1, 1, -1)
-        seq.medusa_head_logits = med_seed.reshape(-1, 1, 1, lm_seed.shape[-1])
+
+        if eos_in_accepted:
+            # Sequence will finish — postprocess will truncate at EOS and mark
+            # as FINISHED. Skip the bonus pass to avoid committing a token after
+            # EOS and wasting a CUDA graph replay.
+            all_new_tokens = accepted
+            seq.medusa_lm_logits = None
+            seq.medusa_head_logits = None
+        else:
+            # Bonus pass: run only the bonus token through the model (1-token CUDA
+            # graph). Writes K/V at the next sequential position and returns logits
+            # to seed the next candidate tree.
+            bonus_pos     = old_committed + accept_length + 1
+            bonus_ctx_len = bonus_pos + 1
+            lm_seed, med_seed = runner.call(
+                "run_medusa_bonus", seq, bonus, bonus_pos, bonus_ctx_len
+            )
+            seq.medusa_lm_logits = lm_seed.reshape(1, 1, -1)
+            seq.medusa_head_logits = med_seed.reshape(-1, 1, 1, lm_seed.shape[-1])
+            all_new_tokens = accepted + [bonus]
 
         # step_drafts = speculative candidates (all tree positions minus root)
         # step_accepted = verified speculative tokens

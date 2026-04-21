@@ -197,6 +197,7 @@ def run_target(
     bench_seed: int = 0,
     bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
+    bench_max_num_seqs: int = 512,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
@@ -275,6 +276,7 @@ def run_target(
         os.environ["BENCH_SEED"] = str(bench_seed)
         os.environ["BENCH_TEMPERATURE"] = str(bench_temperature)
         os.environ["BENCH_WARMUP_SEQS"] = str(bench_warmup_seqs)
+        os.environ["BENCH_MAX_NUM_SEQS"] = str(bench_max_num_seqs)
         os.environ["BENCH_MAIN_MAX_MODEL_LEN"] = str(bench_main_max_model_len)
         os.environ["BENCH_MAIN_GPU_MEMORY_UTILIZATION"] = str(
             bench_main_gpu_memory_utilization
@@ -379,6 +381,7 @@ def main(
     bench_seed: int = 0,
     bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
+    bench_max_num_seqs: int = 512,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
@@ -427,6 +430,7 @@ def main(
             bench_seed,
             bench_temperature,
             bench_warmup_seqs,
+            bench_max_num_seqs,
             bench_main_max_model_len,
             bench_main_gpu_memory_utilization,
             bench_spec_max_model_len,

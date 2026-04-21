@@ -67,6 +67,12 @@ class ModelRunner:
         model_dtype = getattr(hf_config, "dtype", None)
         if model_dtype is None:
             model_dtype = hf_config.torch_dtype
+        # FlashAttention requires fp16 or bf16.  If the checkpoint config
+        # declares float32 (common for small/older models like llama-68m that
+        # were originally trained in fp32), fall back to fp16 so that all
+        # forward passes are compatible with FlashAttention.
+        if model_dtype not in (torch.float16, torch.bfloat16):
+            model_dtype = torch.float16
         self.model_dtype = model_dtype
 
         if not dist.is_initialized():
@@ -106,7 +112,24 @@ class ModelRunner:
             ])
             head_ckpt = os.path.join(medusa_model_path, "medusa_lm_head.pt")
             state = torch.load(head_ckpt, map_location="cuda")
-            self.medusa_heads.load_state_dict(state, strict=False)
+            our_keys = set(self.medusa_heads.state_dict().keys())
+            ckpt_keys = set(state.keys())
+            matched = our_keys & ckpt_keys
+            print(
+                f"[MEDUSA] checkpoint keys: {len(ckpt_keys)}, "
+                f"module keys: {len(our_keys)}, "
+                f"matched: {len(matched)}"
+            )
+            if not matched:
+                print(f"[MEDUSA] WARNING: no keys matched! "
+                      f"Sample ckpt keys: {list(ckpt_keys)[:4]} | "
+                      f"Sample module keys: {list(our_keys)[:4]}")
+            result = self.medusa_heads.load_state_dict(state, strict=False)
+            if result.unexpected_keys:
+                print(f"[MEDUSA] unexpected keys in ckpt: {result.unexpected_keys[:4]}")
+            if result.missing_keys:
+                print(f"[MEDUSA] missing keys in module: {result.missing_keys[:4]}")
+            self.medusa_heads = self.medusa_heads.to(dtype=next(self.model.parameters()).dtype)
             self.medusa_heads.eval()
 
         if model_type == "qwen3":
@@ -151,6 +174,8 @@ class ModelRunner:
                 del self.verify_graphs
             if hasattr(self, "medusa_graph"):
                 del self.medusa_graph, self.medusa_graph_vars
+            if hasattr(self, "medusa_bonus_graph"):
+                del self.medusa_bonus_graph, self.medusa_bonus_graph_vars
         torch.cuda.synchronize()
         if self._owns_process_group and dist.is_initialized():
             dist.destroy_process_group()
@@ -817,6 +842,98 @@ class ModelRunner:
         )  # [num_heads, vocab]
         return lm_logits, medusa_logits
 
+    def copy_accepted_kv_slots(
+        self,
+        seq: "Sequence",
+        accepted_tree_node_indices: list[int],
+        old_committed: int,
+    ) -> None:
+        """Copy K/V for the accepted path from tree-unique slots to sequential slots.
+
+        During tree decode, tree node i was written to the KV slot for logical
+        position old_committed + i (unique per node).  After acceptance we need
+        sequential positions old_committed, old_committed+1, ... to hold the
+        correct K/V so that the next step's prefix attention is accurate.
+
+        The root (tree node 0) is always at the correct position, so it is
+        skipped.  Only depth-1+ accepted nodes need to be moved.
+        """
+        block_table = self._block_table(seq)
+
+        for step, tree_idx in enumerate(accepted_tree_node_indices):
+            if tree_idx == step:
+                continue  # already at the right slot (root is always 0==0)
+            src_lp = old_committed + tree_idx
+            dst_lp = old_committed + step
+            src_block = block_table[src_lp // self.block_size]
+            src_off   = src_lp % self.block_size
+            dst_block = block_table[dst_lp // self.block_size]
+            dst_off   = dst_lp % self.block_size
+            # Copy all layers' K and V in a single slice over the global kv_cache.
+            # kv_cache shape: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+            self.kv_cache[:, :, dst_block, dst_off].copy_(
+                self.kv_cache[:, :, src_block, src_off], non_blocking=True
+            )
+
+    @torch.inference_mode()
+    def run_medusa_bonus(
+        self,
+        seq: "Sequence",
+        bonus_token: int,
+        position: int,
+        context_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a single bonus token through the model and return seed logits.
+
+        Uses the pre-captured 1-token CUDA graph so the overhead is minimal.
+        Writes K/V for `bonus_token` at the given position and returns the
+        LM-head logits and MEDUSA-head logits for seeding the next tree.
+        """
+        block_table = self._block_table(seq)
+        slot = (
+            block_table[position // self.block_size] * self.block_size
+            + position % self.block_size
+        )
+        max_bt = len(block_table)
+
+        if self.enforce_eager or not hasattr(self, "medusa_bonus_graph"):
+            # Eager path (e.g. enforce_eager=True)
+            slot_t = torch.tensor([slot], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            ctx_t  = torch.tensor([context_len], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            pos_t  = torch.tensor([position], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            ids_t  = torch.tensor([bonus_token], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            bt_t   = torch.tensor(
+                [block_table + [-1] * (max(max_bt, 1) - max_bt)],
+                dtype=torch.int32, pin_memory=True,
+            ).cuda(non_blocking=True)
+            set_context(False, slot_mapping=slot_t, context_lens=ctx_t, block_tables=bt_t)
+            hidden = self.model(ids_t, pos_t)
+            reset_context()
+        else:
+            gv = self.medusa_bonus_graph_vars
+            gv["input_ids"][0]    = bonus_token
+            gv["positions"][0]    = position
+            gv["slot_mapping"][0] = slot
+            gv["context_lens"][0] = context_len
+            gv["block_tables"].zero_()
+            bt_t = torch.tensor(block_table, dtype=torch.int32)
+            gv["block_tables"][0, : len(bt_t)] = bt_t.cuda(non_blocking=True)
+            set_context(
+                False,
+                slot_mapping=gv["slot_mapping"],
+                context_lens=gv["context_lens"],
+                block_tables=gv["block_tables"],
+            )
+            self.medusa_bonus_graph.replay()
+            reset_context()
+            hidden = gv["hidden"]  # [1, hidden_size]
+
+        lm_logits = self.model.compute_logits(hidden).squeeze(0)           # [vocab]
+        medusa_logits = torch.stack(
+            [head(hidden).squeeze(0) for head in self.medusa_heads], dim=0
+        )  # [num_heads, vocab]
+        return lm_logits, medusa_logits
+
     @torch.inference_mode()
     def _run_medusa_graph(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -853,17 +970,18 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_medusa_cudagraph(self):
-        """Capture a single CUDA graph for the MEDUSA tree-decode forward pass.
+        """Capture CUDA graphs for MEDUSA mode.
 
-        Fixed shape: [medusa_len] input tokens, batch size 1.  The graph covers
-        only the transformer forward (model.__call__); compute_logits and the
-        MEDUSA heads run eagerly after replay — they're cheap linear layers.
+        1. Tree-decode graph: fixed [medusa_len] input tokens, batch size 1.
+        2. Bonus graph: fixed [1] input token, standard decode context.
+           Used for the per-step bonus-token pass that seeds the next tree.
         """
         config = self.config
         hf_config = config.hf_config
         medusa_len = self.medusa_len
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
+        # ── 1. Tree-decode graph ──────────────────────────────────────────────
         input_ids = torch.zeros(medusa_len, dtype=torch.int64)
         positions = torch.zeros(medusa_len, dtype=torch.int64)
         slot_mapping = torch.full((medusa_len,), -1, dtype=torch.int32)
@@ -904,4 +1022,38 @@ class ModelRunner:
             prefix_lens=prefix_lens,
             block_tables=block_tables,
             hidden_outputs=hidden_outputs,
+        )
+
+        # ── 2. Bonus/seed graph (1 token, standard decode) ───────────────────
+        b_input_ids   = torch.zeros(1, dtype=torch.int64)
+        b_positions   = torch.zeros(1, dtype=torch.int64)
+        b_slot_map    = torch.zeros(1, dtype=torch.int32)
+        b_ctx_lens    = torch.zeros(1, dtype=torch.int32)
+        b_block_tables = torch.zeros(1, max_num_blocks, dtype=torch.int32)
+        b_hidden      = torch.zeros(1, hf_config.hidden_size)
+
+        set_context(
+            False,
+            slot_mapping=b_slot_map,
+            context_lens=b_ctx_lens,
+            block_tables=b_block_tables,
+        )
+        for _ in range(2):
+            b_hidden[:] = self.model(b_input_ids, b_positions)
+        torch.cuda.synchronize()
+
+        bonus_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(bonus_graph, self.graph_pool):
+            b_hidden[:] = self.model(b_input_ids, b_positions)
+        torch.cuda.synchronize()
+        reset_context()
+
+        self.medusa_bonus_graph = bonus_graph
+        self.medusa_bonus_graph_vars = dict(
+            input_ids=b_input_ids,
+            positions=b_positions,
+            slot_mapping=b_slot_map,
+            context_lens=b_ctx_lens,
+            block_tables=b_block_tables,
+            hidden=b_hidden,
         )

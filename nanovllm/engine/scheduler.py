@@ -177,11 +177,17 @@ class Scheduler:
         it's remvoed from the waiting list, and its KV cache is deallocated.
         """
         for seq, token_ids in zip(seqs, seqs_token_ids):
+            # Truncate at the first EOS so that tokens generated after EOS
+            # (e.g. the bonus token in speculative decoding) are not committed.
+            # Standard decode is never affected (it commits exactly 1 token).
+            if not seq.ignore_eos and self.eos in token_ids:
+                eos_idx = token_ids.index(self.eos)
+                token_ids = token_ids[: eos_idx + 1]
             seq.extend(token_ids)
             if (
                 (
                     not seq.ignore_eos
-                    and any(token_id == self.eos for token_id in token_ids)
+                    and token_ids[-1] == self.eos
                 )
                 or seq.num_completion_tokens >= seq.max_tokens
                 or len(seq) >= self.max_model_len

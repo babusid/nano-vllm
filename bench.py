@@ -105,11 +105,18 @@ def bench():
         os.environ.get("MAIN_MODEL_PATH")
         or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.8B/")
     )
+    # BENCH_MAX_NUM_SEQS lets you cap the decode batch size.
+    # Set to 1 for a fair per-sequence latency comparison with MEDUSA
+    # (MEDUSA always runs with decode batch size = 1).
+    max_num_seqs = int(os.environ.get("BENCH_MAX_NUM_SEQS", "512"))
+    print("Max num seqs (decode batch cap): ", max_num_seqs)
+
     main_model_config = Config(
         model=main_model_path,
         max_model_len=main_max_model_len,
         enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
         gpu_memory_utilization=main_gpu_memory_utilization,
+        max_num_seqs=max_num_seqs,
     )
     print("Main Model Path: ", main_model_path)
 
@@ -126,6 +133,7 @@ def bench():
             max_model_len=spec_max_model_len,
             enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
             gpu_memory_utilization=spec_gpu_memory_utilization,
+            max_num_seqs=max_num_seqs,
         )
         print("Small Model Path: ", small_model_path)
         spec_kwargs = dict(
