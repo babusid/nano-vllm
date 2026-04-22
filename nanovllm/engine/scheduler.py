@@ -118,15 +118,7 @@ class Scheduler:
             # reserve medusa_len slots: one for each tree candidate position
             speculation_tokens = self.medusa_len
 
-        # MEDUSA tree-decode is inherently single-sequence: the tree attention
-        # mask is pre-computed for a single request.  Cap the decode batch to 1.
-        decode_max_seqs = (
-            1
-            if self.speculation_mode is SpeculationMode.MEDUSA
-            else self.max_num_seqs
-        )
-
-        while self.running and num_seqs < decode_max_seqs:
+        while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
             bonus_tokens = min(  # make sure the bonus tokens aren't more than the remaining context
                 speculation_tokens,

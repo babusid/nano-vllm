@@ -106,8 +106,8 @@ def bench():
         or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.8B/")
     )
     # BENCH_MAX_NUM_SEQS lets you cap the decode batch size.
-    # Set to 1 for a fair per-sequence latency comparison with MEDUSA
-    # (MEDUSA always runs with decode batch size = 1).
+    # MEDUSA now batches up to this value like NONE/NAIVE; set to 1 if you
+    # want a fair per-sequence latency comparison.
     max_num_seqs = int(os.environ.get("BENCH_MAX_NUM_SEQS", "512"))
     print("Max num seqs (decode batch cap): ", max_num_seqs)
 

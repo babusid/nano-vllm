@@ -186,28 +186,33 @@ def generate_medusa_buffers(
 # Candidate generation (called every decode step on CPU/CUDA)
 # ---------------------------------------------------------------------------
 
-def _get_typical_one_token(
-    logit: torch.Tensor,
+def _get_typical_one_token_batched(
+    logit: torch.Tensor,          # [B, vocab]
     temperature: float,
     posterior_threshold: float,
     posterior_alpha: float,
-) -> torch.Tensor:
-    logit = logit / temperature
-    probs = torch.softmax(logit, dim=-1)
-    entropy = -torch.sum(probs * torch.log(probs + 1e-5), dim=-1)
+) -> torch.Tensor:                # [B, 1]
+    # Upcast to fp32: at very low temperature (e.g. 1e-4) `logit / temperature`
+    # trivially overflows fp16 (max 65504) and produces +inf, which causes
+    # softmax to return NaN and multinomial to raise a device-side assert.
+    logit = logit.float() / temperature
+    probs = torch.softmax(logit, dim=-1)                                   # [B, V]
+    entropy = -torch.sum(probs * torch.log(probs + 1e-5), dim=-1)          # [B]
     threshold = torch.minimum(
         torch.ones_like(entropy) * posterior_threshold,
         torch.exp(-entropy) * posterior_alpha,
-    )
-    logit[probs < threshold.unsqueeze(-1)] = float("-inf")
-    return torch.multinomial(F.softmax(logit, dim=-1), 1)
+    )                                                                       # [B]
+    logit = logit.masked_fill(probs < threshold.unsqueeze(-1), float("-inf"))
+    return torch.multinomial(F.softmax(logit, dim=-1), 1)                  # [B, 1]
 
 
-def _get_nucleus_one_token(
-    logit: torch.Tensor,
+def _get_nucleus_one_token_batched(
+    logit: torch.Tensor,          # [B, vocab]
     temperature: float,
     top_p: float,
-) -> torch.Tensor:
+) -> torch.Tensor:                # [B, 1]
+    # fp32 upcast — same overflow concern as _get_typical_one_token_batched.
+    logit = logit.float()
     if top_p >= 1:
         return torch.multinomial(F.softmax(logit / temperature, dim=-1), 1)
     logit = logit / temperature
@@ -217,7 +222,11 @@ def _get_nucleus_one_token(
     remove = cum_probs > top_p
     remove[..., 1:] = remove[..., :-1].clone()
     remove[..., 0] = 0
-    logit[remove.scatter(dim=1, index=sorted_indices, src=remove)] = float("-inf")
+    # scatter `remove` back to original-logit ordering, then mask
+    remove_in_orig = torch.zeros_like(remove).scatter(
+        dim=1, index=sorted_indices, src=remove
+    )
+    logit = logit.masked_fill(remove_in_orig, float("-inf"))
     return torch.multinomial(F.softmax(logit, dim=-1), 1)
 
 
@@ -233,99 +242,62 @@ def generate_candidates(
     sampling: str = "typical",
     fast: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build tree candidates from the last-accepted-position logits.
+    """Build tree candidates from the last-accepted-position logits (batched).
 
     Args:
-        medusa_logits: [num_heads, 1, 1, vocab_size]  head logits at last pos
-        logits:        [1, 1, vocab_size]              LM-head logits at last pos
-        tree_indices:  [medusa_len]   from generate_medusa_buffers
-        retrieve_indices: [num_paths, depth+1]  from generate_medusa_buffers
-        temperature / posterior_threshold / posterior_alpha / top_p / sampling:
-            sampling hyper-parameters (mirror the orignal MEDUSA API).
-        fast: if True use the faster typical-sampling approximation.
+        medusa_logits: [num_heads, B, 1, vocab_size]   head logits at last pos
+        logits:        [B, 1, vocab_size]              LM-head logits at last pos
+        tree_indices:      [medusa_len]   from generate_medusa_buffers
+        retrieve_indices:  [num_paths, depth+1]  from generate_medusa_buffers
+        temperature: scalar, applied uniformly across the batch (all seqs in a
+            single MEDUSA step must share the same temperature — see
+            _medusa_step for enforcement).
+        posterior_threshold / posterior_alpha / top_p / sampling / fast:
+            sampling hyper-parameters (mirror the original MEDUSA API).
 
     Returns:
-        cart_candidates:  [num_paths, max_depth+1]  cartesian candidate paths
-        tree_candidates:  [1, medusa_len]            token IDs in tree layout
+        cart_candidates:  [B, num_paths, depth+1]  cartesian candidate paths
+        tree_candidates:  [B, medusa_len]           token IDs in tree layout
     """
+    B = logits.size(0)
+    # Top-1 from LM head, shape [B, 1]
     if temperature == 0 or fast:
-        candidates_logit = torch.argmax(logits[:, -1]).unsqueeze(0)
+        candidates_logit = torch.argmax(logits[:, -1], dim=-1, keepdim=True)  # [B, 1]
     else:
         if sampling == "typical":
-            candidates_logit = _get_typical_one_token(
+            candidates_logit = _get_typical_one_token_batched(
                 logits[:, -1], temperature, posterior_threshold, posterior_alpha
-            ).squeeze(0)
+            )                                                                   # [B, 1]
         elif sampling == "nucleus":
-            candidates_logit = _get_nucleus_one_token(
+            candidates_logit = _get_nucleus_one_token_batched(
                 logits[:, -1], temperature, top_p
-            ).squeeze(0)
+            )
         else:
             raise NotImplementedError(f"Unknown sampling strategy: {sampling!r}")
 
-    # Top-k from each head, shape [num_heads, TOPK]
-    candidates_medusa = torch.topk(medusa_logits[:, 0, -1], TOPK, dim=-1).indices
+    # Top-k from each head, shape [num_heads, B, TOPK] → [B, num_heads * TOPK]
+    candidates_medusa = torch.topk(medusa_logits[:, :, -1], TOPK, dim=-1).indices
+    candidates_medusa = candidates_medusa.permute(1, 0, 2).reshape(B, -1)
 
-    # Flat candidate vector: [1 + num_heads * TOPK]
-    candidates = torch.cat([candidates_logit, candidates_medusa.view(-1)], dim=-1)
+    # Flat candidate vector: [B, 1 + num_heads * TOPK]
+    candidates = torch.cat([candidates_logit, candidates_medusa], dim=-1)
 
-    # Map to tree layout
-    tree_candidates = candidates[tree_indices]
-    tree_candidates_ext = torch.cat(
-        [tree_candidates, torch.zeros(1, dtype=torch.long, device=tree_candidates.device)],
-        dim=0,
+    # Map to tree layout: [B, medusa_len]
+    tree_candidates = candidates[:, tree_indices]
+
+    # Extend with a pad column of zeros so retrieve_indices == -? safely indexes 0.
+    pad = torch.zeros(
+        B, 1, dtype=tree_candidates.dtype, device=tree_candidates.device
     )
-    cart_candidates = tree_candidates_ext[retrieve_indices]
+    tree_candidates_ext = torch.cat([tree_candidates, pad], dim=-1)            # [B, medusa_len + 1]
+    cart_candidates = tree_candidates_ext[:, retrieve_indices]                  # [B, num_paths, depth+1]
 
-    return cart_candidates, tree_candidates.unsqueeze(0)
+    return cart_candidates, tree_candidates
 
 
 # ---------------------------------------------------------------------------
 # Posterior evaluation (called every decode step on CPU/CUDA)
 # ---------------------------------------------------------------------------
-
-def _get_typical_posterior_mask(
-    logits: torch.Tensor,
-    candidates: torch.Tensor,
-    temperature: float,
-    posterior_threshold: float,
-    posterior_alpha: float,
-) -> torch.Tensor:
-    logits = logits[:, :-1] / temperature
-    n_samples, n_tokens = logits.shape[:2]
-    logits = logits.view(n_samples * n_tokens, -1)
-    probs = F.softmax(logits, dim=-1)
-    entropy = -torch.sum(probs * torch.log(probs + 1e-5), dim=-1)
-    threshold = torch.minimum(
-        torch.ones_like(entropy) * posterior_threshold,
-        torch.exp(-entropy) * posterior_alpha,
-    )
-    logits[probs < threshold.unsqueeze(-1)] = float("-inf")
-    sampled = torch.multinomial(F.softmax(logits, dim=-1), 1).view(n_samples, n_tokens)
-    return (candidates[:, 1:] == sampled).int()
-
-
-def _get_nucleus_posterior_mask(
-    logits: torch.Tensor,
-    candidates: torch.Tensor,
-    temperature: float,
-    top_p: float,
-) -> torch.Tensor:
-    logits = logits[:, :-1] / temperature
-    n_samples, n_tokens = logits.shape[:2]
-    logits = logits.view(n_samples * n_tokens, -1)
-    if top_p >= 1:
-        sampled = torch.multinomial(F.softmax(logits, dim=-1), 1).view(n_samples, n_tokens)
-        return (candidates[:, 1:] == sampled).int()
-    probs = F.softmax(logits, dim=-1)
-    sorted_logits, sorted_indices = torch.sort(probs, descending=True)
-    cum_probs = torch.cumsum(sorted_logits, dim=-1)
-    remove = cum_probs > top_p
-    remove[..., 1:] = remove[..., :-1].clone()
-    remove[..., 0] = 0
-    logits[remove.scatter(dim=1, index=sorted_indices, src=remove)] = float("-inf")
-    sampled = torch.multinomial(F.softmax(logits, dim=-1), 1).view(n_samples, n_tokens)
-    return (candidates[:, 1:] == sampled).int()
-
 
 def evaluate_posterior(
     logits: torch.Tensor,
@@ -336,77 +308,68 @@ def evaluate_posterior(
     top_p: float = 0.8,
     sampling: str = "typical",
     fast: bool = True,
-) -> tuple[torch.Tensor, int]:
-    """Select the best candidate and its acceptance length.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the best candidate and its acceptance length (batched).
 
     Args:
-        logits:     [num_paths, depth+1, vocab_size]  per-path per-position logits
-        candidates: [num_paths, depth+1]              candidate token IDs
-        temperature / posterior_threshold / posterior_alpha / top_p / sampling / fast:
+        logits:     [B, num_paths, depth+1, vocab_size]  per-path per-position logits
+        candidates: [B, num_paths, depth+1]              candidate token IDs
+        temperature: scalar, uniform across the batch.
+        posterior_threshold / posterior_alpha / top_p / sampling / fast:
             sampling hyper-parameters.
 
     Returns:
-        best_candidate: scalar LongTensor — index of chosen path
-        accept_length:  int — number of accepted speculative tokens (≥ 0)
+        best_candidate: [B] LongTensor — index of chosen path per seq
+        accept_length:  [B] LongTensor — number of accepted speculative tokens per seq
     """
+    # Greedy path (temperature == 0): deterministic argmax match.
     if temperature == 0:
         posterior_mask = (
-            candidates[:, 1:] == torch.argmax(logits[:, :-1], dim=-1)
-        ).int()
-        candidates_accept_length = torch.cumprod(posterior_mask, dim=1).sum(dim=1)
-        accept_length = candidates_accept_length.max()
-        if accept_length == 0:
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, int(accept_length)
+            candidates[:, :, 1:] == torch.argmax(logits[:, :, :-1], dim=-1)
+        ).int()                                                        # [B, P, D]
+        accept_len_per_path = torch.cumprod(posterior_mask, dim=-1).sum(dim=-1)  # [B, P]
+        accept_length = accept_len_per_path.max(dim=-1).values         # [B]
+        best_candidate = accept_len_per_path.argmax(dim=-1).to(torch.long)  # [B]
+        return best_candidate, accept_length
 
-    if sampling == "typical":
-        if fast:
-            posterior_prob = torch.softmax(logits[:, :-1] / temperature, dim=-1)
-            candidates_prob = torch.gather(
-                posterior_prob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
-            ).squeeze(-1)
-            posterior_entropy = -torch.sum(
-                posterior_prob * torch.log(posterior_prob + 1e-5), dim=-1
-            )
-            threshold = torch.minimum(
-                torch.ones_like(posterior_entropy) * posterior_threshold,
-                torch.exp(-posterior_entropy) * posterior_alpha,
-            )
-            posterior_mask = candidates_prob > threshold
-            candidates_accept_length = torch.cumprod(posterior_mask, dim=1).sum(dim=1)
-            accept_length = candidates_accept_length.max()
-            if accept_length == 0:
-                best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-            else:
-                best_candidates = torch.where(candidates_accept_length == accept_length)[0]
-                likelihood = torch.sum(
-                    torch.log(candidates_prob[best_candidates, :accept_length]), dim=-1
-                )
-                best_candidate = best_candidates[torch.argmax(likelihood)]
-            return best_candidate, int(accept_length)
-
-        posterior_mask = _get_typical_posterior_mask(
-            logits, candidates, temperature, posterior_threshold, posterior_alpha
+    # Fast typical sampling — the default path used by the engine.
+    if sampling == "typical" and fast:
+        # fp32 upcast: avoids overflow at low temperature (logit / 1e-4 easily
+        # exceeds fp16 range and yields NaN probabilities).
+        posterior_prob = torch.softmax(logits[:, :, :-1].float() / temperature, dim=-1)  # [B, P, D, V]
+        candidates_prob = torch.gather(
+            posterior_prob, dim=-1, index=candidates[:, :, 1:].unsqueeze(-1)
+        ).squeeze(-1)                                                            # [B, P, D]
+        posterior_entropy = -torch.sum(
+            posterior_prob * torch.log(posterior_prob + 1e-5), dim=-1
+        )                                                                         # [B, P, D]
+        threshold = torch.minimum(
+            torch.ones_like(posterior_entropy) * posterior_threshold,
+            torch.exp(-posterior_entropy) * posterior_alpha,
         )
-        candidates_accept_length = torch.cumprod(posterior_mask, dim=1).sum(dim=1)
-        accept_length = candidates_accept_length.max()
-        if accept_length == 0:
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, int(accept_length)
+        posterior_mask = (candidates_prob > threshold).int()                      # [B, P, D]
+        accept_len_per_path = torch.cumprod(posterior_mask, dim=-1).sum(dim=-1)   # [B, P]
+        accept_length = accept_len_per_path.max(dim=-1).values                    # [B]
 
-    if sampling == "nucleus":
-        assert top_p < 1.0 + 1e-6, "top_p must be in (0, 1]"
-        posterior_mask = _get_nucleus_posterior_mask(logits, candidates, temperature, top_p)
-        candidates_accept_length = torch.cumprod(posterior_mask, dim=1).sum(dim=1)
-        accept_length = candidates_accept_length.max()
-        if accept_length == 0:
-            best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
-        else:
-            best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, int(accept_length)
+        # For seqs with nonzero accept_length, pick the path with the highest
+        # joint log-prob among those achieving the max length. For seqs with
+        # zero, best_candidate is unused downstream (accept_length = 0 short-
+        # circuits to "commit only the bonus token"), so argmax of all-zero
+        # lengths returning 0 is fine.
+        is_max = accept_len_per_path == accept_length.unsqueeze(-1)               # [B, P]
+        # log-prob sum up to the accept length; pad past accept_length with 0.
+        log_prob = torch.log(candidates_prob.clamp_min(1e-9))                     # [B, P, D]
+        depth = log_prob.size(-1)
+        pos = torch.arange(depth, device=log_prob.device)                         # [D]
+        valid = pos.unsqueeze(0) < accept_length.unsqueeze(-1)                    # [B, D]
+        masked_log_prob = log_prob * valid.unsqueeze(1).float()                   # [B, P, D]
+        likelihood = masked_log_prob.sum(dim=-1)                                   # [B, P]
+        # Penalize non-max paths by -inf so argmax selects among is_max paths.
+        likelihood = likelihood.masked_fill(~is_max, float("-inf"))
+        best_candidate = likelihood.argmax(dim=-1).to(torch.long)                 # [B]
+        return best_candidate, accept_length
 
-    raise NotImplementedError(f"Unknown sampling strategy: {sampling!r}")
+    raise NotImplementedError(
+        f"Batched evaluate_posterior currently supports temperature==0 or "
+        f"sampling='typical' with fast=True. Got sampling={sampling!r}, fast={fast!r}."
+    )

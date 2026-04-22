@@ -130,7 +130,7 @@ class Attention(nn.Module):
         v_cache: torch.Tensor,
         context,
     ) -> torch.Tensor:
-        """Split-attention for MEDUSA tree decode (batch size = 1).
+        """Split-attention for MEDUSA tree decode (any batch size).
 
         The KV of the tree candidates has already been written to the paged
         cache by store_kvcache above.  We compute attention in two parts and
@@ -138,83 +138,80 @@ class Attention(nn.Module):
         mathematically equivalent to a single softmax over the full KV:
 
           Part 1 – prefix attention (FlashAttention):
-            All medusa_len query tokens attend to the committed prefix KV
-            (context.prefix_lens slots), with causal=False because every tree
-            node should see the full context.  We ask FA to return the LSE so
+            All medusa_len query tokens per seq attend to that seq's committed
+            prefix KV (context.prefix_lens[b] slots), with causal=False because
+            every tree node should see the full context.  FA returns the LSE so
             we can later recombine.
 
           Part 2 – tree-to-tree attention (dense matmul):
             The medusa_len queries also attend to each other, but only to their
             ancestor nodes.  The precomputed additive mask (0 / -inf) enforces
             the tree structure.  The tree is small (≤ 64 nodes), so the dense
-            matmul cost is negligible.
+            matmul cost is negligible even batched.
 
           Combination:
             out = softmax_weight(lse_prefix) * out_prefix
                 + softmax_weight(lse_tree)   * out_tree
             where the weights come from the log-sum-exp of each part.
         """
-        # k, v: [medusa_len, num_kv_heads, head_dim]  — the tree candidate K/V
-        medusa_len = k.size(0)
+        # q, k, v: [B * medusa_len, num_{q|kv}_heads, head_dim]
+        B = context.prefix_lens.size(0)
+        N = q.size(0)
+        medusa_len = N // B
+        H = self.num_heads
+        Hkv = self.num_kv_heads
+        D = self.head_dim
+        kv_groups = H // Hkv
 
         # --- Part 1: prefix attention via FlashAttention ---
-        # prefix_lens holds the committed-only lengths, so FA reads exactly
-        # the prefix slots and ignores the tree slots we just stored.
-        q_4d = q.view(1, medusa_len, self.num_heads, self.head_dim)
+        # prefix_lens holds per-seq committed lengths, so FA reads exactly each
+        # seq's prefix slots and ignores the tree slots we just stored.
+        q_4d = q.view(B, medusa_len, H, D)
         out_p, lse_p = flash_attn_with_kvcache(
             q_4d,
             k_cache,
             v_cache,
-            cache_seqlens=context.prefix_lens,
-            block_table=context.block_tables,
+            cache_seqlens=context.prefix_lens,       # [B]
+            block_table=context.block_tables,        # [B, max_bt]
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,
         )
-        # out_p: [1, medusa_len, num_heads, head_dim]
-        # lse_p: [1, num_heads, medusa_len]
-        out_p = out_p.squeeze(0)             # [medusa_len, num_heads, head_dim]
-        lse_p = lse_p.squeeze(0)             # [num_heads, medusa_len]
+        # out_p: [B, medusa_len, H, D]      lse_p: [B, H, medusa_len]
 
         # --- Part 2: tree-to-tree attention via dense matmul ---
-        # Reshape for [num_heads, medusa_len, head_dim] matmuls.
-        # Use num_heads for q but num_kv_heads for k/v; expand kv if GQA.
-        num_kv = self.num_kv_heads
-        num_q  = self.num_heads
-        kv_groups = num_q // num_kv
-
-        # q_h: [num_heads, medusa_len, head_dim]
-        q_h = q.permute(1, 0, 2)
-        # k_h: [num_kv_heads, head_dim, medusa_len] → expand to [num_heads, ...]
-        k_h = k.permute(1, 2, 0)
+        # Reshape for [B, H, medusa_len, D] matmuls.  Expand kv heads for GQA.
+        q_h = q.view(B, medusa_len, H, D).permute(0, 2, 1, 3)                  # [B, H, L, D]
+        k_h = k.view(B, medusa_len, Hkv, D).permute(0, 2, 3, 1)                # [B, Hkv, D, L]
+        v_h = v.view(B, medusa_len, Hkv, D).permute(0, 2, 1, 3)                # [B, Hkv, L, D]
         if kv_groups > 1:
-            k_h = k_h.repeat_interleave(kv_groups, dim=0)
-        # v_h: [num_heads, medusa_len, head_dim]
-        v_h = v.permute(1, 0, 2)
-        if kv_groups > 1:
-            v_h = v_h.repeat_interleave(kv_groups, dim=0)
+            k_h = k_h.repeat_interleave(kv_groups, dim=1)                      # [B, H, D, L]
+            v_h = v_h.repeat_interleave(kv_groups, dim=1)                      # [B, H, L, D]
 
-        # Attention scores [num_heads, medusa_len, medusa_len] with tree mask
+        # Attention scores [B, H, L, L] with tree mask (broadcasts over B and H)
         scores = torch.matmul(q_h, k_h) * self.scale
-        # medusa_tree_mask: [1, 1, medusa_len, medusa_len] additive bias
-        scores = scores + context.medusa_tree_mask.squeeze(0)  # [1, Lq, Lq] broadcast
+        scores = scores + context.medusa_tree_mask                             # [1,1,L,L]
 
         # LSE and weighted output for tree part
-        lse_t = torch.logsumexp(scores.float(), dim=-1)         # [num_heads, medusa_len]
+        lse_t = torch.logsumexp(scores.float(), dim=-1)                        # [B, H, L]
         attn_w = torch.softmax(scores.float(), dim=-1).to(v_h.dtype)
-        out_t = torch.matmul(attn_w, v_h)                       # [num_heads, medusa_len, head_dim]
+        out_t = torch.matmul(attn_w, v_h)                                       # [B, H, L, D]
 
         # --- Combine via online log-sum-exp ---
-        lse_c = torch.logaddexp(lse_p.float(), lse_t)           # [num_heads, medusa_len]
-        w_p = (lse_p.float() - lse_c).exp().unsqueeze(-1)       # [num_heads, medusa_len, 1]
+        lse_c = torch.logaddexp(lse_p.float(), lse_t)                          # [B, H, L]
+        w_p = (lse_p.float() - lse_c).exp().unsqueeze(-1)                      # [B, H, L, 1]
         w_t = (lse_t          - lse_c).exp().unsqueeze(-1)
 
-        # out_p is [medusa_len, num_heads, head_dim]; permute for [num_heads, ...]
-        out_p_h = out_p.permute(1, 0, 2)                        # [num_heads, medusa_len, head_dim]
-        out_combined = w_p * out_p_h + w_t * out_t              # [num_heads, medusa_len, head_dim]
+        out_p_h = out_p.permute(0, 2, 1, 3)                                    # [B, H, L, D]
+        out_combined = w_p * out_p_h + w_t * out_t                              # [B, H, L, D]
 
         # Cast back to the original query dtype (e.g. float16) before returning.
         # w_p / w_t are computed in float32 for numerical stability, which
         # promotes the combined output; without this cast, o_proj (float16
         # weights) raises a dtype mismatch.
-        return out_combined.to(q.dtype).permute(1, 0, 2).contiguous()
+        return (
+            out_combined.to(q.dtype)
+            .permute(0, 2, 1, 3)
+            .reshape(B * medusa_len, H, D)
+            .contiguous()
+        )

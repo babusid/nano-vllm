@@ -213,7 +213,18 @@ class LLMEngine:
     def _medusa_step(
         self, seqs: list[Sequence], is_prefill: bool
     ) -> tuple[list[list[int]], int, int]:
-        """Execute one MEDUSA engine step.
+        """Execute one MEDUSA engine step for a batch of sequences.
+
+        The entire step runs in a single batched pipeline with exactly one
+        GPU→CPU synchronization point (after posterior evaluation), regardless
+        of batch size:
+
+          1. Batched seed pass (only seqs that just prefilled)
+          2. Batched candidate tree construction
+          3. Single batched tree-decode forward (CUDA-graphed)
+          4. Batched posterior evaluation + bonus sampling + sync
+          5. Batched KV scatter to commit accepted paths into sequential slots
+          6. Batched bonus-token seed pass (only seqs not hitting EOS)
 
         Returns
         -------
@@ -223,8 +234,11 @@ class LLMEngine:
         """
         runner = self.model_runners[0]
         buffers = self.medusa_buffers
-        retrieve_indices = buffers["retrieve_indices"]  # [num_paths, depth+1]
-        tree_indices = buffers["tree_indices"]          # [medusa_len]
+        retrieve_indices = buffers["retrieve_indices"]   # [num_paths, depth+1] CUDA
+        tree_indices     = buffers["tree_indices"]        # [medusa_len] CUDA
+        medusa_len       = buffers["medusa_len"]
+        eos              = self.model_config.eos
+        block_size       = self.model_config.kvcache_block_size
 
         # ---- Prefill ----
         if is_prefill:
@@ -235,102 +249,147 @@ class LLMEngine:
                 seq.medusa_head_logits = None
             return [[tok] for tok in token_ids], -1, -1
 
-        # ---- Decode (batch size is always 1 in MEDUSA mode) ----
-        assert len(seqs) == 1, "MEDUSA decode requires batch size 1"
-        seq = seqs[0]
-
-        # Seed pass (first decode step after each prefill): write the first
-        # generated token's KV using the bonus CUDA graph, then get LM +
-        # MEDUSA-head logits to seed the first candidate tree.
-        if seq.medusa_lm_logits is None:
-            seed_pos = len(seq) - 1          # logical position of last committed token
-            lm_s, med_s = runner.call(
-                "run_medusa_bonus", seq, seq.last_token, seed_pos, len(seq)
+        # ---- Decode (any batch size) ----
+        B = len(seqs)
+        # Uniform-temperature assumption — keeps generate_candidates /
+        # evaluate_posterior fully vectorized.  Benchmarks use a single
+        # SamplingParams so this is the common case; relax to per-bucket
+        # loops if mixed-temperature batches are ever needed.
+        temperature = seqs[0].temperature
+        if any(s.temperature != temperature for s in seqs):
+            raise NotImplementedError(
+                "MEDUSA batch currently requires uniform sampling temperature across seqs"
             )
-            seq.medusa_lm_logits = lm_s.reshape(1, 1, -1)
-            seq.medusa_head_logits = med_s.reshape(-1, 1, 1, lm_s.shape[-1])
 
-        # Build the candidate tree from stored per-position logits.
+        # ── [1] Batched seed pass for seqs whose logits were cleared ─────────
+        seed_idx = [i for i, s in enumerate(seqs) if s.medusa_lm_logits is None]
+        if seed_idx:
+            seed_seqs = [seqs[i] for i in seed_idx]
+            lm_s, head_s = runner.call(
+                "run_medusa_decode_batch",
+                seed_seqs,
+                [s.last_token for s in seed_seqs],
+                [len(s) - 1   for s in seed_seqs],   # seed writes KV at last committed pos
+                [len(s)       for s in seed_seqs],   # context_len = committed length
+            )
+            # lm_s: [S, V]      head_s: [H, S, V]
+            for j, i in enumerate(seed_idx):
+                seqs[i].medusa_lm_logits   = lm_s[j : j + 1].unsqueeze(1)          # [1,1,V]
+                seqs[i].medusa_head_logits = head_s[:, j : j + 1].unsqueeze(2)     # [H,1,1,V]
+
+        # ── [2] Assemble batched logits stacks ───────────────────────────────
+        lm_stack   = torch.cat([s.medusa_lm_logits   for s in seqs], dim=0)         # [B,1,V]
+        head_stack = torch.cat([s.medusa_head_logits for s in seqs], dim=1)         # [H,B,1,V]
+
+        # ── [3] Batched candidate tree construction ──────────────────────────
         cart_candidates, tree_candidates = generate_candidates(
-            seq.medusa_head_logits,
-            seq.medusa_lm_logits,
-            tree_indices,
-            retrieve_indices,
-            temperature=seq.temperature,
+            head_stack, lm_stack, tree_indices, retrieve_indices,
+            temperature=temperature,
         )
-        # cart_candidates : [num_paths, depth+1]   cartesian paths
-        # tree_candidates : [1, medusa_len]         flat tree layout
+        # cart_candidates : [B, num_paths, depth+1]
+        # tree_candidates : [B, medusa_len]
 
-        # Run all medusa_len tree candidates through the model in one pass.
-        lm_logits, _ = runner.call(
-            "run_medusa_tree", seqs, {seq.seq_id: tree_candidates}
-        )
-        # lm_logits : [medusa_len, vocab]
+        # ── [4] Single batched tree-decode forward (CUDA-graphed) ────────────
+        lm_logits, _ = runner.call("run_medusa_tree", seqs, tree_candidates)
+        # lm_logits : [B*medusa_len, vocab]
+        V = lm_logits.size(-1)
+        lm_logits_b = lm_logits.view(B, medusa_len, V)
 
-        # Posterior evaluation: find the best accepted path.
-        path_logits = lm_logits[retrieve_indices]   # [num_paths, depth+1, vocab]
+        # ── [5] Batched posterior evaluation ─────────────────────────────────
+        path_logits = lm_logits_b[:, retrieve_indices]   # [B, num_paths, depth+1, V]
         best_candidate, accept_length = evaluate_posterior(
             path_logits,
             cart_candidates,
-            temperature=seq.temperature,
+            temperature=temperature,
         )
+        # best_candidate : [B]    accept_length : [B]
 
-        # Accepted tokens: root (position 0 in path) + accept_length speculative.
-        accepted = cart_candidates[best_candidate, : accept_length + 1].tolist()
-
-        # Bonus token: sampled from the model's prediction at the last accepted node.
-        accept_node = int(retrieve_indices[best_candidate, accept_length])
-        if seq.temperature == 0:
-            bonus = int(lm_logits[accept_node].argmax())
+        # ── [6] Batched bonus-token sampling ─────────────────────────────────
+        batch_idx = torch.arange(B, device=lm_logits_b.device)
+        accept_nodes = retrieve_indices[best_candidate, accept_length]   # [B]
+        bonus_logits = lm_logits_b[batch_idx, accept_nodes]              # [B, V]
+        if temperature == 0:
+            bonus_tokens = bonus_logits.argmax(dim=-1)                   # [B]
         else:
-            bonus = int(
-                (lm_logits[accept_node] / seq.temperature)
-                .softmax(dim=-1)
-                .multinomial(1)
+            # fp32 upcast — same overflow concern as generate_candidates /
+            # evaluate_posterior: at low temperatures, fp16 logits / temperature
+            # overflow to +inf and softmax returns NaN.
+            bonus_probs = torch.softmax(bonus_logits.float() / temperature, dim=-1)
+            bonus_tokens = torch.multinomial(bonus_probs, 1).squeeze(-1)
+
+        # ── [7] Gather the accepted cartesian paths (still on GPU) ──────────
+        chosen_paths = cart_candidates[batch_idx, best_candidate]         # [B, depth+1]
+
+        # Single GPU→CPU sync for all scheduling decisions this step.
+        best_cand_cpu   = best_candidate.cpu().tolist()
+        accept_len_cpu  = accept_length.cpu().tolist()
+        chosen_paths_cpu = chosen_paths.cpu().tolist()
+        bonus_tokens_cpu = bonus_tokens.cpu().tolist()
+        # retrieve_indices is constant across steps; .cpu() once and cache.
+        if not hasattr(self, "_retrieve_indices_cpu"):
+            self._retrieve_indices_cpu = retrieve_indices.cpu().tolist()
+        retrieve_cpu = self._retrieve_indices_cpu
+
+        # ── [8] Batched KV scatter for accepted paths ────────────────────────
+        # Tree node i was stored at slot old_committed + i (unique per node).
+        # Accepted path's nodes must move to sequential slots old_committed,
+        # old_committed+1, … so the next step's prefix attention is correct.
+        # Skip nodes already at the right slot (root is always 0==0).
+        src_flat: list[int] = []
+        dst_flat: list[int] = []
+        committed_lens = [len(s) for s in seqs]
+        for b in range(B):
+            old = committed_lens[b]
+            bt = seqs[b].block_table
+            accept_len_b = accept_len_cpu[b]
+            nodes = retrieve_cpu[best_cand_cpu[b]][: accept_len_b + 1]
+            for step, tree_idx in enumerate(nodes):
+                if tree_idx == step:
+                    continue
+                src_lp = old + tree_idx
+                dst_lp = old + step
+                src_flat.append(bt[src_lp // block_size] * block_size + src_lp % block_size)
+                dst_flat.append(bt[dst_lp // block_size] * block_size + dst_lp % block_size)
+        if src_flat:
+            runner.call("copy_accepted_kv_slots_batched", src_flat, dst_flat)
+
+        # ── Build final per-seq token lists, deciding bonus eligibility ─────
+        out_tokens: list[list[int]] = []
+        continuing: list[int] = []       # seq indices that should receive a bonus pass
+        total_accepted = 0
+        for b in range(B):
+            accept_len_b = accept_len_cpu[b]
+            accepted = chosen_paths_cpu[b][: accept_len_b + 1]
+            total_accepted += accept_len_b
+            if eos in accepted:
+                # Sequence will finish — skip bonus pass to avoid a post-EOS token.
+                out_tokens.append(accepted)
+                seqs[b].medusa_lm_logits = None
+                seqs[b].medusa_head_logits = None
+            else:
+                out_tokens.append(accepted + [bonus_tokens_cpu[b]])
+                continuing.append(b)
+
+        # ── [9] Batched bonus pass for continuing seqs (single decode forward) ──
+        if continuing:
+            cs = [seqs[i] for i in continuing]
+            bonus_pos = [committed_lens[i] + accept_len_cpu[i] + 1 for i in continuing]
+            bonus_tok = [bonus_tokens_cpu[i] for i in continuing]
+            lm_seed, head_seed = runner.call(
+                "run_medusa_decode_batch",
+                cs,
+                bonus_tok,
+                bonus_pos,
+                [p + 1 for p in bonus_pos],
             )
+            # lm_seed: [C, V]      head_seed: [H, C, V]
+            for j, i in enumerate(continuing):
+                seqs[i].medusa_lm_logits   = lm_seed[j : j + 1].unsqueeze(1)       # [1,1,V]
+                seqs[i].medusa_head_logits = head_seed[:, j : j + 1].unsqueeze(2)  # [H,1,1,V]
 
-        old_committed = len(seq)    # position where the new tokens start
-
-        # Check for EOS in the accepted path. If found, we skip the bonus pass
-        # entirely — the sequence is about to finish and the bonus token would be
-        # a spurious token generated after EOS that inflates total token counts.
-        eos = self.model_config.eos
-        eos_in_accepted = eos in accepted
-
-        # K/V copy: tree node i was stored at slot old_committed+i (unique).
-        # The accepted path's nodes need to be at sequential slots
-        # old_committed+0, old_committed+1, ... before the next prefix-attention.
-        # We copy directly in the kv_cache tensor — no model re-run needed.
-        accepted_tree_nodes = retrieve_indices[best_candidate, : accept_length + 1].tolist()
-        runner.call(
-            "copy_accepted_kv_slots", seq, accepted_tree_nodes, old_committed
-        )
-
-        if eos_in_accepted:
-            # Sequence will finish — postprocess will truncate at EOS and mark
-            # as FINISHED. Skip the bonus pass to avoid committing a token after
-            # EOS and wasting a CUDA graph replay.
-            all_new_tokens = accepted
-            seq.medusa_lm_logits = None
-            seq.medusa_head_logits = None
-        else:
-            # Bonus pass: run only the bonus token through the model (1-token CUDA
-            # graph). Writes K/V at the next sequential position and returns logits
-            # to seed the next candidate tree.
-            bonus_pos     = old_committed + accept_length + 1
-            bonus_ctx_len = bonus_pos + 1
-            lm_seed, med_seed = runner.call(
-                "run_medusa_bonus", seq, bonus, bonus_pos, bonus_ctx_len
-            )
-            seq.medusa_lm_logits = lm_seed.reshape(1, 1, -1)
-            seq.medusa_head_logits = med_seed.reshape(-1, 1, 1, lm_seed.shape[-1])
-            all_new_tokens = accepted + [bonus]
-
-        # step_drafts = speculative candidates (all tree positions minus root)
-        # step_accepted = verified speculative tokens
-        step_drafts = buffers["medusa_len"] - 1
-        step_accepted = accept_length
-        return [all_new_tokens], step_drafts, step_accepted
+        step_drafts   = B * (medusa_len - 1)
+        step_accepted = total_accepted
+        return out_tokens, step_drafts, step_accepted
 
     def step(self):
         with torch.profiler.record_function("llm.step.schedule"):
