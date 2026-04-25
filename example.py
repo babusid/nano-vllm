@@ -37,7 +37,9 @@ def example():
     # speculation config comes from env so run_modal.py flags can propagate
     spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
     spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
-    use_spec = spec_mode_str == "naive"
+    use_naive = spec_mode_str == "naive"
+    use_eagle = spec_mode_str == "eagle"
+    use_spec = use_naive or use_eagle
     print(f"Spec: mode={spec_mode_str} length={spec_length if use_spec else '-'}")
 
     # size memory pool to add up to 90% of GPU memory
@@ -53,10 +55,10 @@ def example():
     )
     print("Main Model Path: ", main_model_path)
 
-    # only construct the speculator config when naive spec is requested —
+    # only construct the speculator config when spec is requested —
     # Config.__post_init__ hits the filesystem / HF cache
     spec_kwargs = {}
-    if use_spec:
+    if use_naive:
         small_model_path = os.path.expanduser(
             os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
         )
@@ -71,6 +73,34 @@ def example():
             speculation_mode=SpeculationMode.NAIVE_SPECULATION,
             speculator_config=[small_model_config],
             speculation_length=spec_length,
+        )
+    elif use_eagle:
+        eagle_model_path = os.path.expanduser(
+            os.environ.get("EAGLE_HEAD_PATH", "~/huggingface/Qwen3-32B_eagle3/")
+        )
+        eagle_model_config = Config(
+            model=eagle_model_path,
+            max_model_len=spec_max_model_len,
+            enforce_eager=True,  # eagle MVP is eager-only; see model_runner
+            gpu_memory_utilization=spec_gpu_memory_utilization,
+        )
+        # EAGLE-3 captures 3 mid-layer hiddens from the target. Defaults
+        # follow the SafeAILab convention of (early, mid, late); override
+        # with EAGLE_CAPTURE_LAYERS="2,32,61" if the head was trained
+        # against different indices.
+        capture_str = os.environ.get("EAGLE_CAPTURE_LAYERS", "")
+        if capture_str:
+            capture_ids = [int(x) for x in capture_str.split(",")]
+        else:
+            n_layers = main_model_config.hf_config.num_hidden_layers
+            capture_ids = [2, n_layers // 2, n_layers - 3]
+        print(f"Eagle Head Path: {eagle_model_path}")
+        print(f"Eagle Capture Layers: {capture_ids}")
+        spec_kwargs = dict(
+            speculation_mode=SpeculationMode.EAGLE,
+            speculator_config=[eagle_model_config],
+            speculation_length=spec_length,
+            eagle_capture_layer_ids=capture_ids,
         )
 
     llm = LLM(

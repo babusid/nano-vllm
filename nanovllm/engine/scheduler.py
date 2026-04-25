@@ -18,15 +18,21 @@ class Scheduler:
         self.speculation_mode = speculation_mode
         self.speculator_config = speculator_config
         self.speculation_length = speculation_length
-        _spec_conf = [
-            self.speculation_mode is not SpeculationMode.NONE,
-            self.speculator_config,
-            self.speculation_length,
-        ]
-        if any(_spec_conf) and not all(_spec_conf):
-            raise ValueError(
-                "Speculation mode, speculator config and speculation length must be specified together"
-            )
+
+        # Naive spec needs the full bundle. EAGLE needs a draft length too
+        # (for slot reservation) but no speculator_config (the head is loaded
+        # by the engine, not via Config).
+        if speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            if not speculator_config or not speculation_length:
+                raise ValueError(
+                    "Speculation mode, speculator config and speculation "
+                    "length must all be specified for naive speculation"
+                )
+        if speculation_mode is SpeculationMode.EAGLE:
+            if not speculation_length or speculation_length < 1:
+                raise ValueError(
+                    "speculation_length must be >= 1 for EAGLE speculation"
+                )
 
         self.max_num_seqs = config.max_num_seqs  # batch size in sequences
         self.max_num_batched_tokens = (
@@ -108,6 +114,11 @@ class Scheduler:
             # from the verifier
             speculation_tokens = self.speculation_length + 1
             # speculation_tokens = self.speculation_length
+        elif self.speculation_mode is SpeculationMode.EAGLE:
+            # EAGLE chain commits at most K tokens per step (K-1 drafts + the
+            # verifier-argmax at rejection / cap position). Reserve K+1 to
+            # match naive's pattern and stay safely above the actual commit.
+            speculation_tokens = self.speculation_length + 1
 
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
@@ -160,15 +171,19 @@ class Scheduler:
         it's remvoed from the waiting list, and its KV cache is deallocated.
         """
         for seq, token_ids in zip(seqs, seqs_token_ids):
+            # Truncate at the first EOS so post-EOS tokens (e.g. EAGLE
+            # bonus / drafts beyond an EOS) aren't committed.
+            if not seq.ignore_eos and self.eos in token_ids:
+                eos_idx = token_ids.index(self.eos)
+                token_ids = token_ids[: eos_idx + 1]
             seq.extend(token_ids)
             if (
-                (
-                    not seq.ignore_eos
-                    and any(token_id == self.eos for token_id in token_ids)
-                )
+                (not seq.ignore_eos and token_ids and token_ids[-1] == self.eos)
                 or seq.num_completion_tokens >= seq.max_tokens
                 or len(seq) >= self.max_model_len
             ):
                 seq.status = SequenceStatus.FINISHED
+                # Drop EAGLE per-seq tensor refs so the GPU memory is freed.
+                seq.eagle_target_fused = None
                 self._deallocate(seq)
                 self.running.remove(seq)

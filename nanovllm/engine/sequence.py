@@ -1,6 +1,9 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from typing import Optional
+
+import torch
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -53,6 +56,13 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+        # EAGLE-3 per-seq state. Only populated in EAGLE mode; cleared on EOS
+        # by the scheduler to avoid pinning GPU tensors after a seq finishes.
+        # eagle_target_fused: [3H] target's mid-layer-fused hidden at
+        # position (len(seq) - 1) — i.e. at the last committed token. Used
+        # next step to seed the head's chain step 1 via fc projection.
+        self.eagle_target_fused: Optional[torch.Tensor] = None
 
     @property
     def block_tables(self) -> list[list[int]]:

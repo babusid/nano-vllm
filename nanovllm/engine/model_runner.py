@@ -8,7 +8,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3 import Qwen3ForCausalLM, Qwen3Eagle3ForCausalLM
 from nanovllm.models.vicuna import VicunaForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -36,6 +36,9 @@ class ModelRunner:
         block_managers: list[BlockManager] | None = None,
         model_runner_idx: int = 0,
         verify_seqlen_q: int | None = None,
+        # EAGLE-3 wiring (all None/False outside EAGLE mode):
+        is_eagle_head: bool = False,
+        eagle_capture_layer_ids: list[int] | None = None,
     ):
         self.config = config
         self.block_managers = block_managers if block_managers is not None else []
@@ -45,9 +48,18 @@ class ModelRunner:
         # bs * verify_seqlen_q query tokens so verify() can replay instead of
         # running eagerly. Only the verifier runner needs this.
         self.verify_seqlen_q = verify_seqlen_q
+        # EAGLE-3 mode flags. The "head" runner is the small draft model; the
+        # "verifier" runner is the target model with capture layers configured.
+        # Capture is implemented as Python-side list ops on Qwen3Model, which
+        # don't survive CUDA graph capture, so the verifier runs eager when
+        # capture is on. Head runner is also eager initially — its forward
+        # signature differs from run() so the standard graphs don't apply.
+        self.is_eagle_head = is_eagle_head
+        self.eagle_capture_layer_ids = eagle_capture_layer_ids
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        force_eager_for_eagle = is_eagle_head or eagle_capture_layer_ids is not None
+        self.enforce_eager = config.enforce_eager or force_eager_for_eagle
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -55,6 +67,16 @@ class ModelRunner:
         model_dtype = getattr(hf_config, "dtype", None)
         if model_dtype is None:
             model_dtype = hf_config.torch_dtype
+        # The published Qwen3 Eagle-3 head checkpoint stores fp16 weights even
+        # though config.json advertises bf16. Keep the head in fp16 to avoid
+        # unnecessary recasting and closer-match reference implementations.
+        if is_eagle_head:
+            model_dtype = torch.float16
+        # FlashAttention requires fp16 or bf16; small/old checkpoints (e.g.
+        # llama-68m) declare fp32. Coerce to fp16 so the same forward path
+        # works. EAGLE-3 head config is bf16 already so this is a no-op there.
+        if model_dtype not in (torch.float16, torch.bfloat16):
+            model_dtype = torch.float16
         self.model_dtype = model_dtype
 
         if not dist.is_initialized():
@@ -68,7 +90,12 @@ class ModelRunner:
         torch.set_default_dtype(self.model_dtype)
         torch.set_default_device("cuda")
         model_type = getattr(hf_config, "model_type", None)
-        if model_type == "qwen3":
+        if is_eagle_head:
+            # AngelSlim release advertises model_type="llama" but with the
+            # EAGLE-3 architecture; route on the explicit flag instead of
+            # model_type so we don't conflict with vanilla Llama loads.
+            self.model = Qwen3Eagle3ForCausalLM(hf_config)
+        elif model_type == "qwen3":
             self.model = Qwen3ForCausalLM(hf_config)
         elif model_type == "llama":
             self.model = VicunaForCausalLM(hf_config)
@@ -77,14 +104,45 @@ class ModelRunner:
                 f"Unsupported model_type {model_type!r}; "
                 "nano-vllm supports qwen3 and llama (e.g. Vicuna) checkpoints."
             )
-        load_model(self.model, config.model)
-        if model_type == "qwen3":
+        load_report = load_model(
+            self.model,
+            config.model,
+            allow_unexpected=is_eagle_head,
+        )
+        if is_eagle_head and self.rank == 0:
+            print(
+                "EAGLE head load summary: "
+                f"config_dtype={getattr(hf_config, 'torch_dtype', None)}, "
+                f"runner_dtype={self.model_dtype}, "
+                f"checkpoint_dtypes={load_report['checkpoint_dtypes']}, "
+                f"loaded_tensors={load_report['num_loaded']}"
+            )
+            if load_report["unexpected_keys"]:
+                print("EAGLE head unexpected checkpoint keys:")
+                for key in load_report["unexpected_keys"]:
+                    print(f"  {key}")
+            if load_report["missing_keys"]:
+                print("EAGLE head missing model keys:")
+                for key in load_report["missing_keys"]:
+                    print(f"  {key}")
+        # Wire up the verifier's mid-layer hidden capture for EAGLE-3 fusion.
+        # Set on self.model.model so that every forward populates _captured.
+        if eagle_capture_layer_ids is not None and not is_eagle_head:
+            self.model.model.set_capture_layer_ids(eagle_capture_layer_ids)
+        if is_eagle_head:
+            # Plain Sampler — head's lm_head outputs over draft vocab; we
+            # only ever sample from it via greedy argmax in the chain path,
+            # but keep the standard sampler available for future temperature
+            # support.
+            self.sampler = Sampler()
+        elif model_type == "qwen3":
             self.sampler = Qwen3Sampler()
         elif model_type == "llama":
             self.sampler = VicunaSampler()
         else:
             self.sampler = Sampler()
-        self.warmup_model()
+        if not is_eagle_head:
+            self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -109,7 +167,8 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            if hasattr(self, "graphs"):
+                del self.graphs, self.graph_pool
             if hasattr(self, "verify_graphs"):
                 del self.verify_graphs
         torch.cuda.synchronize()
@@ -619,3 +678,268 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    # ------------------------------------------------------------------
+    # EAGLE-3 methods
+    #
+    # The verifier-side methods (run_with_capture / verify_with_capture) reuse
+    # prepare_prefill / prepare_decode / prepare_verify and add a side-channel
+    # that returns the captured 3-layer fused hidden tensor. Capture is set up
+    # once at __init__ time via eagle_capture_layer_ids; the model walks the
+    # capture each forward and stashes the listed layer outputs.
+    #
+    # The head-side methods (eagle_*) live on the second runner that owns the
+    # Qwen3Eagle3ForCausalLM model and its own paged KV cache. They build a
+    # context manually and feed the head's three-arg forward.
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def run_with_capture(
+        self, seqs: list[Sequence], is_prefill: bool
+    ) -> tuple[list[int] | None, torch.Tensor, list[int] | None]:
+        """Like run() but additionally returns the target's per-position
+        3-layer-fused hidden state for downstream EAGLE consumption.
+
+        Returns
+        -------
+        token_ids: per-seq sampled tokens (rank-0 only).
+        fused_hidden: [N, 3H] CUDA tensor — captured residual stream at the
+            configured layers, concatenated along the feature dim. N equals
+            the total query-token count: prefill→sum(seqlen_q), decode→len(seqs).
+        cu_seqlens_q: prefill cu_seqlens_q as a CPU list (so the engine can
+            slice fused_hidden per seq); None for decode.
+        """
+        assert (
+            self.eagle_capture_layer_ids is not None
+        ), "run_with_capture requires eagle_capture_layer_ids set at init"
+        self.model.model.clear_captures()
+        input_ids, positions = (
+            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        )
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        # Eager forward (capture isn't graph-friendly today).
+        hidden_states = self.model(input_ids, positions)
+        fused = self.model.model.captured_hidden()
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = (
+            self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        )
+        ctx = get_context()
+        cu_seqlens_q = ctx.cu_seqlens_q.cpu().tolist() if is_prefill else None
+        reset_context()
+        self.model.model.clear_captures()
+        return token_ids, fused, cu_seqlens_q
+
+    @torch.inference_mode()
+    def verify_with_capture(
+        self, seqs: list[Sequence], draft_model_idx: int = 1
+    ) -> tuple[
+        list[list[int]] | None,
+        list[torch.Tensor] | None,
+        list[torch.Tensor] | None,
+    ]:
+        """Verify path that additionally returns per-seq fused hidden tensors.
+
+        Returns
+        -------
+        per_seq_token_ids: list of [K_i+1] sampled tokens per seq (or None on
+            non-rank-0).
+        per_seq_logits: list of [K_i+1, V] target logits per seq.
+        per_seq_fused: list of [K_i+1, 3H] fused hidden tensors per seq.
+        """
+        assert self.eagle_capture_layer_ids is not None
+        self.model.model.clear_captures()
+        input_ids, positions = self.prepare_verify(seqs, draft_model_idx)
+        seq_temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        hidden_states = self.model(input_ids, positions)
+        fused = self.model.model.captured_hidden()  # [N, 3H]
+        logits = self.model.compute_logits(hidden_states)
+        reset_context()
+        self.model.model.clear_captures()
+
+        dlens = [len(seq.draft_token_ids[draft_model_idx]) for seq in seqs]
+        if self.rank == 0:
+            repeats = torch.tensor(
+                [dlen + 1 if dlen > 0 else 0 for dlen in dlens],
+                dtype=torch.int64,
+                device=seq_temperatures.device,
+            )
+            expanded_temperatures = seq_temperatures.repeat_interleave(repeats)
+            assert expanded_temperatures.size(0) == logits.size(0)
+            flat_token_ids = self.sample(logits, expanded_temperatures)
+            split_logits, split_token_ids, split_fused = [], [], []
+            start = 0
+            for dlen in dlens:
+                end = start + (dlen + 1 if dlen > 0 else 0)
+                split_logits.append(logits[start:end])
+                split_token_ids.append(flat_token_ids[start:end])
+                split_fused.append(fused[start:end])
+                start = end
+            return split_token_ids, split_logits, split_fused
+        return None, None, None
+
+    @torch.inference_mode()
+    def project_fused_hidden(self, fused: torch.Tensor) -> torch.Tensor:
+        """Apply the head's fc(hidden_norm(.)) projection to a fused hidden.
+
+        Lives on the head runner; engine sends the fused tensor here once per
+        seeded position and reuses the result across the chain via eagle_step.
+        """
+        assert self.is_eagle_head
+        return self.model.project_target_hidden(fused)
+
+    @torch.inference_mode()
+    def eagle_prompt_prefill(
+        self,
+        seqs: list[Sequence],
+        per_seq_fused: list[torch.Tensor],
+    ) -> None:
+        """Populate the head's KV cache from the prompt's target hiddens.
+
+        For each seq with prompt of length L >= 2: feeds the head positions
+        [0..L-2] using token_ids[0..L-2] as input and fc(target_fused[0..L-2])
+        as prev_hidden. After this, the head's KV holds keys/values for the
+        committed prefix excluding the final prompt token. The first decode
+        chain step then writes position (L-1) exactly once and predicts token L.
+
+        per_seq_fused[i] must have shape [L_i, 3H] (one row per prompt
+        position; the last row is unused here but kept by callers for the
+        first decode step's seed).
+        """
+        assert self.is_eagle_head
+        input_ids: list[int] = []
+        positions: list[int] = []
+        cu_q = [0]
+        cu_k = [0]
+        max_q = 0
+        max_k = 0
+        slot_mapping: list[int] = []
+        fused_chunks: list[torch.Tensor] = []
+
+        for seq, fused in zip(seqs, per_seq_fused):
+            L = len(seq)
+            if L < 2:
+                # No prefix to seed from (sequence is just BOS); the first
+                # decode step will populate the eagle KV directly.
+                continue
+            block_table = self._block_table(seq)
+            input_ids.extend(seq.token_ids[: L - 1])
+            positions.extend(range(0, L - 1))
+            n = L - 1
+            cu_q.append(cu_q[-1] + n)
+            cu_k.append(cu_k[-1] + n)
+            max_q = max(max_q, n)
+            max_k = max(max_k, n)
+            for p in range(0, L - 1):
+                slot_mapping.append(
+                    block_table[p // self.block_size] * self.block_size
+                    + p % self.block_size
+                )
+            assert fused.size(0) >= L, (
+                f"per_seq_fused[i] needs >= {L} rows for seq of length {L}, "
+                f"got {fused.size(0)}"
+            )
+            fused_chunks.append(fused[: L - 1])
+
+        if not input_ids:
+            return
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, device="cuda")
+        positions_t = torch.tensor(positions, dtype=torch.int64, device="cuda")
+        cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device="cuda")
+        cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device="cuda")
+        slot_mapping_t = torch.tensor(slot_mapping, dtype=torch.int32, device="cuda")
+        fused_t = torch.cat(fused_chunks, dim=0).to(self.model_dtype)
+
+        set_context(
+            True,
+            cu_seqlens_q=cu_q_t,
+            cu_seqlens_k=cu_k_t,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            slot_mapping=slot_mapping_t,
+        )
+        prev_hidden = self.model.project_target_hidden(fused_t)
+        _ = self.model(input_ids_t, positions_t, prev_hidden)
+        reset_context()
+
+    @torch.inference_mode()
+    def eagle_step(
+        self,
+        seqs: list[Sequence],
+        input_tokens: list[int],
+        positions: list[int],
+        prev_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One chain decode step on the head (writes 1 KV slot per seq).
+
+        Args
+        ----
+        seqs:         B sequences (used to read block_tables[head_idx]).
+        input_tokens: length-B list of target-vocab token ids to feed.
+        positions:    length-B list of absolute positions for those tokens.
+        prev_hidden:  [B, H] either project_fused_hidden(...) at the seeded
+                      step, or the head's own previous hidden for recurrent
+                      steps. The engine decides which.
+
+        Returns
+        -------
+        hidden_out:   [B, H] the head's post-norm hidden for this step.
+        draft_logits: [B, draft_vocab] logits to sample the draft token from.
+        """
+        assert self.is_eagle_head
+        B = len(seqs)
+        slot_list: list[int] = []
+        for seq, p in zip(seqs, positions):
+            bt = self._block_table(seq)
+            slot_list.append(
+                bt[p // self.block_size] * self.block_size + p % self.block_size
+            )
+        input_ids_t = torch.tensor(input_tokens, dtype=torch.int64, device="cuda")
+        positions_t = torch.tensor(positions, dtype=torch.int64, device="cuda")
+        slot_mapping_t = torch.tensor(slot_list, dtype=torch.int32, device="cuda")
+        # cache covers positions 0..p (inclusive of just-written slot)
+        context_lens_t = torch.tensor(
+            [p + 1 for p in positions], dtype=torch.int32, device="cuda"
+        )
+        block_tables_t = self.prepare_block_tables(seqs)
+        set_context(
+            False,
+            slot_mapping=slot_mapping_t,
+            context_lens=context_lens_t,
+            block_tables=block_tables_t,
+        )
+        hidden_out = self.model(input_ids_t, positions_t, prev_hidden)
+        draft_logits = self.model.compute_logits(hidden_out)
+        reset_context()
+        return hidden_out, draft_logits
+
+    @torch.inference_mode()
+    def eagle_translate(self, draft_token: int) -> int:
+        """Apply d2t additive offset to map a draft-vocab token to target vocab."""
+        assert self.is_eagle_head
+        return int(draft_token + self.model.d2t[draft_token].item())
+
+    @torch.inference_mode()
+    def eagle_debug_vocab_stats(self) -> dict[str, int | list[int]]:
+        """Return compact vocab-map stats for Eagle debugging."""
+        assert self.is_eagle_head
+        d2t = self.model.d2t
+        t2d = self.model.t2d
+        return {
+            "d2t_min": int(d2t.min().item()),
+            "d2t_max": int(d2t.max().item()),
+            "d2t_first8": d2t[:8].cpu().tolist(),
+            "t2d_true_count": int(t2d.sum().item()),
+        }
+
+    @torch.inference_mode()
+    def load_target_embeddings(self, embed_weight: torch.Tensor) -> None:
+        """Seed the head's token embeddings from the target model.
+
+        The published Eagle-3 head checkpoint appears to omit `embed_tokens`,
+        so we initialize it from the verifier target model after both runners
+        are constructed.
+        """
+        assert self.is_eagle_head
+        self.model.embed_tokens.weight.copy_(embed_weight.to(self.model_dtype))

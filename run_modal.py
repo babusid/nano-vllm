@@ -20,6 +20,10 @@ Usage:
     # Run benchmark with naive speculation, length 8
     modal run run_modal.py --target bench --spec-mode naive --spec-length 8
 
+    # Run benchmark with EAGLE-3 speculative decoding (chain length 5)
+    modal run run_modal.py --target bench --spec-mode eagle --spec-length 5 \
+        --main-model "Qwen/Qwen3-32B" --eagle-head "AngelSlim/Qwen3-32B_eagle3"
+
     # Run benchmark with custom models
     modal run run_modal.py --target bench --main-model "Qwen/Qwen3-8B" --spec-model "Qwen/Qwen3-0.6B"
 
@@ -112,13 +116,23 @@ SHAREGPT_PATH = "/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 def _download_model(repo_id: str, revision: str = "", enable_cache: bool = True) -> str:
     import os
+    from glob import glob
     from huggingface_hub import snapshot_download
 
     model_name = repo_id.rstrip("/").split("/")[-1]
     model_path = f"/root/huggingface/{model_name}"
-    if os.path.isfile(os.path.join(model_path, "config.json")) and enable_cache:
+    # Cache hit only if both config and weights are on disk; a stale dir with
+    # just config.json (e.g. from a previous failed download) needs a redo.
+    has_config = os.path.isfile(os.path.join(model_path, "config.json"))
+    has_weights = bool(
+        glob(os.path.join(model_path, "*.safetensors"))
+        or glob(os.path.join(model_path, "pytorch_model*.bin"))
+    )
+    if has_config and has_weights and enable_cache:
         print(f"using cached model: {model_path}")
         return model_path
+    if has_config and not has_weights:
+        print(f"cache at {model_path} has config but no weights — re-downloading")
 
     download_kwargs = {"repo_id": repo_id, "local_dir": model_path}
     if revision:
@@ -174,6 +188,10 @@ def run_target(
     main_revision: str = "",
     spec_model: str = "",
     spec_revision: str = "",
+    eagle_head: str = "",
+    eagle_revision: str = "",
+    eagle_capture_layers: str = "",
+    eagle_debug: bool = False,
     spec_mode: str = "none",
     spec_length: int = 1,
     profile: bool = False,
@@ -215,14 +233,15 @@ def run_target(
     import sys
     import torch
 
-    if target not in {"bench", "example", "arc"}:
+    if target not in {"bench", "example", "arc", "inspect-eagle"}:
         raise ValueError(
-            f"target must be one of ['bench', 'example', 'arc'], got {target!r}"
+            f"target must be one of ['bench', 'example', 'arc', 'inspect-eagle'], "
+            f"got {target!r}"
         )
     spec_mode_norm = spec_mode.lower()
-    if spec_mode_norm not in {"none", "naive"}:
+    if spec_mode_norm not in {"none", "naive", "eagle"}:
         raise ValueError(
-            f"spec_mode must be one of ['none', 'naive'], got {spec_mode!r}"
+            f"spec_mode must be one of ['none', 'naive', 'eagle'], got {spec_mode!r}"
         )
     if spec_length < 1:
         raise ValueError(f"spec_length must be >= 1, got {spec_length}")
@@ -239,12 +258,31 @@ def run_target(
     print(f"Profiler: enabled={profile}")
     print(f"Enforce eager: {enforce_eager}")
 
+    if target == "inspect-eagle":
+        # Download the eagle head and dump its key/shape inventory.
+        eagle_repo = eagle_head or "AngelSlim/Qwen3-32B_eagle3"
+        os.environ["EAGLE_HEAD_PATH"] = _download_model(eagle_repo, eagle_revision)
+        workspace_dir = "/workspace"
+        if workspace_dir not in sys.path:
+            sys.path.insert(0, workspace_dir)
+        runpy.run_path(
+            os.path.join(workspace_dir, "inspect_eagle.py"), run_name="__main__"
+        )
+        return
+
     main_repo = main_model or "Qwen/Qwen3-8B"
     os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
     # only pull the speculator when we're actually going to use it
-    if spec_mode_norm != "none":
+    if spec_mode_norm == "naive":
         spec_repo = spec_model or "Qwen/Qwen3-0.6B"
         os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    elif spec_mode_norm == "eagle":
+        eagle_repo = eagle_head or "AngelSlim/Qwen3-32B_eagle3"
+        os.environ["EAGLE_HEAD_PATH"] = _download_model(eagle_repo, eagle_revision)
+        if eagle_capture_layers:
+            os.environ["EAGLE_CAPTURE_LAYERS"] = eagle_capture_layers
+        if eagle_debug:
+            os.environ["EAGLE_DEBUG"] = "1"
 
     # propagate spec config to the target script via env
     os.environ["SPEC_MODE"] = spec_mode_norm
@@ -341,6 +379,10 @@ def main(
     main_revision: str = "",
     spec_model: str = "Qwen/Qwen3-0.6B",
     spec_revision: str = "",
+    eagle_head: str = "AngelSlim/Qwen3-32B_eagle3",
+    eagle_revision: str = "",
+    eagle_capture_layers: str = "",
+    eagle_debug: bool = False,
     spec_mode: str = "none",
     spec_length: int = 1,
     profile: bool = False,
@@ -384,6 +426,10 @@ def main(
             main_revision,
             spec_model,
             spec_revision,
+            eagle_head,
+            eagle_revision,
+            eagle_capture_layers,
+            eagle_debug,
             spec_mode,
             spec_length,
             profile,

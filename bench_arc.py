@@ -48,6 +48,7 @@ def _build_llm(
     spec_max_model_len: int,
     spec_gpu_memory_utilization: float,
     enforce_eager: bool,
+    eagle_capture_layers: list[int] | None = None,
 ) -> LLM:
     main_config = Config(
         model=model_path,
@@ -70,6 +71,25 @@ def _build_llm(
             speculation_mode=SpeculationMode.NAIVE_SPECULATION,
             speculator_config=[spec_config],
             speculation_length=spec_length,
+        )
+    elif spec_mode == "eagle":
+        if not spec_path:
+            raise ValueError("EAGLE_HEAD_PATH must be set when SPEC_MODE=eagle")
+        eagle_head_config = Config(
+            model=spec_path,
+            max_model_len=spec_max_model_len,
+            enforce_eager=True,  # eagle MVP is eager-only
+            gpu_memory_utilization=spec_gpu_memory_utilization,
+        )
+        capture_ids = eagle_capture_layers or []
+        if not capture_ids:
+            n_layers = main_config.hf_config.num_hidden_layers
+            capture_ids = [2, n_layers // 2, n_layers - 3]
+        spec_kwargs = dict(
+            speculation_mode=SpeculationMode.EAGLE,
+            speculator_config=[eagle_head_config],
+            speculation_length=spec_length,
+            eagle_capture_layer_ids=capture_ids,
         )
 
     return LLM(model_config=main_config, **spec_kwargs)
@@ -95,9 +115,9 @@ def bench_arc():
     dataset_cache_dir = os.environ.get("ARC_CACHE_DIR", "") or None
 
     spec_mode = os.environ.get("SPEC_MODE", "none").lower()
-    if spec_mode not in {"none", "naive"}:
+    if spec_mode not in {"none", "naive", "eagle"}:
         raise ValueError(
-            f"SPEC_MODE must be one of ['none', 'naive'], got {spec_mode!r}"
+            f"SPEC_MODE must be one of ['none', 'naive', 'eagle'], got {spec_mode!r}"
         )
     spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
     if spec_length < 1:
@@ -107,7 +127,18 @@ def bench_arc():
         os.environ.get("MAIN_MODEL_PATH")
         or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-8B/")
     )
-    spec_path = os.path.expanduser(os.environ.get("SPEC_MODEL_PATH", ""))
+    # naive uses SPEC_MODEL_PATH (small model); eagle uses EAGLE_HEAD_PATH
+    # (the EAGLE-3 head ckpt). Pick the right one for the active mode.
+    if spec_mode == "eagle":
+        spec_path = os.path.expanduser(os.environ.get("EAGLE_HEAD_PATH", ""))
+    else:
+        spec_path = os.path.expanduser(os.environ.get("SPEC_MODEL_PATH", ""))
+    eagle_capture_layers_env = os.environ.get("EAGLE_CAPTURE_LAYERS", "")
+    eagle_capture_layers = (
+        [int(x) for x in eagle_capture_layers_env.split(",")]
+        if eagle_capture_layers_env
+        else None
+    )
     main_max_model_len = int(os.environ.get("ARC_MAIN_MAX_MODEL_LEN", "4096"))
     main_gpu_memory_utilization = float(
         os.environ.get("ARC_MAIN_GPU_MEMORY_UTILIZATION", "0.8")
@@ -119,10 +150,16 @@ def bench_arc():
     enforce_eager = os.environ.get("ENFORCE_EAGER", "0") == "1"
 
     print(f"Spec mode          : {spec_mode}")
-    print(f"Spec length        : {spec_length if spec_mode == 'naive' else '-'}")
+    print(
+        f"Spec length        : "
+        f"{spec_length if spec_mode in ('naive', 'eagle') else '-'}"
+    )
     print(f"Model              : {model_path}")
     if spec_mode == "naive":
         print(f"Draft              : {spec_path}")
+    elif spec_mode == "eagle":
+        print(f"Eagle head         : {spec_path}")
+        print(f"Capture layers     : {eagle_capture_layers or '<auto>'}")
     print(f"Examples           : {num_examples}")
     print(f"Warmup examples    : {warmup_examples}")
     print(f"Seed               : {sampling_seed}")
@@ -152,6 +189,7 @@ def bench_arc():
         spec_max_model_len=spec_max_model_len,
         spec_gpu_memory_utilization=spec_gpu_memory_utilization,
         enforce_eager=enforce_eager,
+        eagle_capture_layers=eagle_capture_layers,
     )
 
     sampling_params = SamplingParams(temperature=temperature, max_tokens=1)
