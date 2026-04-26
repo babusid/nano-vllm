@@ -10,7 +10,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.medusa_utils import ResBlock
+from nanovllm.engine.medusa_utils import MedusaBlock, remap_medusa_lm_head_state_dict
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.vicuna import VicunaForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -98,20 +98,21 @@ class ModelRunner:
         load_model(self.model, config.model)
 
         # Load MEDUSA heads alongside the base model weights when in MEDUSA mode.
-        # Each head is medusa_num_layers ResBlocks followed by a linear projection
-        # to vocab_size. Weights are read from medusa_lm_head.pt in the checkpoint.
+        # Each head is medusa_num_layers ResBlocks + vocab Linear (see MedusaBlock).
+        # Weights are read from medusa_lm_head.pt in the checkpoint.
         if medusa_model_path:
             hidden_size = hf_config.hidden_size
             vocab_size = hf_config.vocab_size
-            self.medusa_heads = nn.ModuleList([
-                nn.Sequential(
-                    *[ResBlock(hidden_size) for _ in range(medusa_num_layers)],
-                    nn.Linear(hidden_size, vocab_size, bias=False),
-                )
-                for _ in range(medusa_num_heads)
-            ])
+            self.medusa_heads = nn.ModuleList(
+                [
+                    MedusaBlock(hidden_size, vocab_size, medusa_num_layers)
+                    for _ in range(medusa_num_heads)
+                ]
+            )
             head_ckpt = os.path.join(medusa_model_path, "medusa_lm_head.pt")
-            state = torch.load(head_ckpt, map_location="cuda")
+            state = remap_medusa_lm_head_state_dict(
+                torch.load(head_ckpt, map_location="cuda")
+            )
             our_keys = set(self.medusa_heads.state_dict().keys())
             ckpt_keys = set(state.keys())
             matched = our_keys & ckpt_keys

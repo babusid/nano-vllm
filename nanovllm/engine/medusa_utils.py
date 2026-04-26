@@ -12,6 +12,8 @@ Sources:
   medusa_repo/Medusa/medusa/model/medusa_choices.py (default topologies)
 """
 
+import re
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,6 +75,53 @@ class ResBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.act(self.linear(x))
+
+
+class MedusaBlock(nn.Module):
+    """One Medusa head: ``num_layers`` :class:`ResBlock` then a vocab ``Linear``.
+
+    Implemented as ``nn.Sequential`` under ``self.net`` so ``forward`` can be
+    ``torch.compile``d as a single region. Checkpoints from the older layout
+    (``ModuleList`` of bare ``Sequential``, keys ``<h>.0.linear…``) are
+    adapted by :func:`remap_medusa_lm_head_state_dict` before ``load_state_dict``.
+    """
+
+    def __init__(self, hidden_size: int, vocab_size: int, num_layers: int):
+        super().__init__()
+        layers: list[nn.Module] = [
+            *(ResBlock(hidden_size) for _ in range(num_layers)),
+            nn.Linear(hidden_size, vocab_size, bias=False),
+        ]
+        self.net = nn.Sequential(*layers)
+
+    @torch.compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+_MEDUSA_HEAD_KEY = re.compile(r"^(\d+)\.(\d+)\.")
+
+
+def remap_medusa_lm_head_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Map flat ``medusa_lm_head.pt`` keys into :class:`MedusaBlock` layout.
+
+    HuggingFace / Medusa checkpoints use ``{head_idx}.{seq_idx}.…`` (one
+    ``nn.Sequential`` per head, no wrapper). We store ``Sequential`` as
+    ``head.net``, so keys become ``{head_idx}.net.{seq_idx}.…``.
+    """
+    out: dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        if ".net." in k:
+            out[k] = v
+            continue
+        m = _MEDUSA_HEAD_KEY.match(k)
+        if m:
+            h, s = m.group(1), m.group(2)
+            rest = k[m.end() :]
+            out[f"{h}.net.{s}.{rest}"] = v
+        else:
+            out[k] = v
+    return out
 
 
 # ---------------------------------------------------------------------------
