@@ -198,9 +198,101 @@ class LLMEngine:
         )
         self.scheduler.add(seq)
 
-    def _naive_specdec_step(self):
-        # todo; split the step method into dispatch pattern
-        pass
+    def _naive_specdec_step(
+        self, seqs: list[Sequence], is_prefill: bool
+    ) -> tuple[list[list[int]], int, int]:
+        # get the two model runners for regular specdec
+        verifier_model_idx = 0
+        drafter_model_idx = 1
+        verifier = self.model_runners[verifier_model_idx]
+        drafter = self.model_runners[drafter_model_idx]
+        if is_prefill:
+            # fill the kv of both models, but ignore the draft token
+            with torch.profiler.record_function("spec.prefill.drafter_run"):
+                drafter.call("run", seqs, is_prefill)
+            with torch.profiler.record_function("spec.prefill.verifier_run"):
+                token_ids, _ = verifier.call("run", seqs, is_prefill)
+            token_ids = [[tok] for tok in token_ids]
+            return token_ids, -1, -1
+        else:
+            # generate draft tokens
+            for _ in range(self.speculation_length):
+                with torch.profiler.record_function("spec.decode.drafter_run"):
+                    draft_ids, draft_logits = drafter.call("run", seqs, is_prefill)
+                # add draft tokens to the sequence's draft token ids
+
+                # TODO: update this so that draft_ids is a list of lists and use extend
+                # so we don't do the appending in the draft loop
+                for seq, draft_id, draft_logit in zip(seqs, draft_ids, draft_logits):
+                    seq.draft_token_ids[drafter_model_idx].append(draft_id)
+                    seq.draft_token_logits[drafter_model_idx].append(draft_logit)
+
+            # generate logits for the draft tokens
+            # ignore the token that gets generated
+            with torch.profiler.record_function("spec.decode.verifier_verify"):
+                verif_token_ids, verif_logits = verifier.call(
+                    "verify", seqs, drafter_model_idx
+                )
+
+            # accept/reject per sequence
+            token_ids = []
+            step_drafts = 0
+            step_accepted = 0
+            with torch.profiler.record_function("spec.decode.accept_reject"):
+                for idx, seq in enumerate(seqs):
+                    draft_tokens = seq.draft_token_ids[drafter_model_idx]
+                    small_logits = seq.draft_token_logits[drafter_model_idx]
+                    big_token_ids = verif_token_ids[idx]
+                    draft_big_logits = verif_logits[idx][:-1]
+                    seq_accept = []
+                    step_drafts += len(draft_tokens)
+                    seq_accepted_drafts = 0
+                    for tok, small, big in zip(
+                        draft_tokens, small_logits, draft_big_logits
+                    ):
+                        # upcast to fp32 — fp16 logits (esp. Vicuna-33B) can
+                        # overflow and poison softmax with inf/nan, which
+                        # propagates into residual and trips multinomial's
+                        # probability-validity assert.
+                        small_prob_dist = small.float().softmax(dim=-1)
+                        big_prob_dist = big.float().softmax(dim=-1)
+                        p_small = small_prob_dist[tok]
+                        p_big = big_prob_dist[tok]
+                        accept = p_big >= p_small
+                        if not accept:
+                            accept = p_big.new_empty(()).uniform_() < (
+                                p_big / (p_small + 1e-12)
+                            )
+                        if accept:
+                            seq_accept.append(tok)
+                            seq_accepted_drafts += 1
+                            continue
+                        residual = (big_prob_dist - small_prob_dist).clamp_min(0)
+                        rsum = residual.sum()
+                        if rsum <= 0 or not torch.isfinite(rsum):
+                            # big ≤ small everywhere (or non-finite): fall
+                            # back to sampling from the target distribution
+                            bonus_token = big_prob_dist.multinomial(1).item()
+                        else:
+                            bonus_token = (residual / rsum).multinomial(1).item()
+                        seq_accept.append(bonus_token)
+                        break
+                    if seq_accepted_drafts == len(draft_tokens) and draft_tokens:
+                        assert len(big_token_ids) == len(draft_tokens) + 1
+                        seq_accept.append(big_token_ids[-1])
+                    step_accepted += seq_accepted_drafts
+                    if not seq_accept:
+                        assert big_token_ids
+                        seq_accept.append(big_token_ids[0])
+
+                    token_ids.append(seq_accept)
+
+            # empty draft token list
+            for seq in seqs:
+                seq.draft_token_ids[1] = []
+                seq.draft_token_logits[1] = []
+
+            return token_ids, step_drafts, step_accepted
 
     # ------------------------------------------------------------------
     # MEDUSA step logic
@@ -410,97 +502,10 @@ class LLMEngine:
                 )
 
         elif self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
-            # get the two model runners for regular specdec
-            verifier_model_idx = 0
-            drafter_model_idx = 1
-            verifier = self.model_runners[verifier_model_idx]
-            drafter = self.model_runners[drafter_model_idx]
-            if is_prefill:
-                # fill the kv of both models, but ignore the draft token
-                with torch.profiler.record_function("spec.prefill.drafter_run"):
-                    drafter.call("run", seqs, is_prefill)
-                with torch.profiler.record_function("spec.prefill.verifier_run"):
-                    token_ids, _ = verifier.call("run", seqs, is_prefill)
-                token_ids = [[tok] for tok in token_ids]
-            else:
-                # generate draft tokens
-                for _ in range(self.speculation_length):
-                    with torch.profiler.record_function("spec.decode.drafter_run"):
-                        draft_ids, draft_logits = drafter.call("run", seqs, is_prefill)
-                    # add draft tokens to the sequence's draft token ids
-
-                    # TODO: update this so that draft_ids is a list of lists and use extend
-                    # so we don't do the appending in the draft loop
-                    for seq, draft_id, draft_logit in zip(
-                        seqs, draft_ids, draft_logits
-                    ):
-                        seq.draft_token_ids[drafter_model_idx].append(draft_id)
-                        seq.draft_token_logits[drafter_model_idx].append(draft_logit)
-
-                # generate logits for the draft tokens
-                # ignore the token that gets generated
-                with torch.profiler.record_function("spec.decode.verifier_verify"):
-                    verif_token_ids, verif_logits = verifier.call(
-                        "verify", seqs, drafter_model_idx
-                    )
-
-                # accept/reject per sequence
-                token_ids = []
-                step_drafts = 0
-                step_accepted = 0
-                with torch.profiler.record_function("spec.decode.accept_reject"):
-                    for idx, seq in enumerate(seqs):
-                        draft_tokens = seq.draft_token_ids[drafter_model_idx]
-                        small_logits = seq.draft_token_logits[drafter_model_idx]
-                        big_token_ids = verif_token_ids[idx]
-                        draft_big_logits = verif_logits[idx][:-1]
-                        seq_accept = []
-                        step_drafts += len(draft_tokens)
-                        seq_accepted_drafts = 0
-                        for tok, small, big in zip(
-                            draft_tokens, small_logits, draft_big_logits
-                        ):
-                            # upcast to fp32 — fp16 logits (esp. Vicuna-33B) can
-                            # overflow and poison softmax with inf/nan, which
-                            # propagates into residual and trips multinomial's
-                            # probability-validity assert.
-                            small_prob_dist = small.float().softmax(dim=-1)
-                            big_prob_dist = big.float().softmax(dim=-1)
-                            p_small = small_prob_dist[tok]
-                            p_big = big_prob_dist[tok]
-                            accept = p_big >= p_small
-                            if not accept:
-                                accept = p_big.new_empty(()).uniform_() < (
-                                    p_big / (p_small + 1e-12)
-                                )
-                            if accept:
-                                seq_accept.append(tok)
-                                seq_accepted_drafts += 1
-                                continue
-                            residual = (big_prob_dist - small_prob_dist).clamp_min(0)
-                            rsum = residual.sum()
-                            if rsum <= 0 or not torch.isfinite(rsum):
-                                # big ≤ small everywhere (or non-finite): fall
-                                # back to sampling from the target distribution
-                                bonus_token = big_prob_dist.multinomial(1).item()
-                            else:
-                                bonus_token = (residual / rsum).multinomial(1).item()
-                            seq_accept.append(bonus_token)
-                            break
-                        if seq_accepted_drafts == len(draft_tokens) and draft_tokens:
-                            assert len(big_token_ids) == len(draft_tokens) + 1
-                            seq_accept.append(big_token_ids[-1])
-                        step_accepted += seq_accepted_drafts
-                        if not seq_accept:
-                            assert big_token_ids
-                            seq_accept.append(big_token_ids[0])
-
-                        token_ids.append(seq_accept)
-
-                # empty draft token list
-                for seq in seqs:
-                    seq.draft_token_ids[1] = []
-                    seq.draft_token_logits[1] = []
+            with torch.profiler.record_function("spec.step"):
+                token_ids, step_drafts, step_accepted = self._naive_specdec_step(
+                    seqs, is_prefill
+                )
         else:
             with torch.profiler.record_function("base.run"):
                 token_ids, _ = self.model_runners[0].call("run", seqs, is_prefill)
