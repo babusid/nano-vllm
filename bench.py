@@ -143,9 +143,8 @@ def bench():
         )
     elif use_medusa:
         import json as _json
-        medusa_model_path = os.path.expanduser(
-            os.environ.get("MEDUSA_MODEL_PATH", "")
-        )
+
+        medusa_model_path = os.path.expanduser(os.environ.get("MEDUSA_MODEL_PATH", ""))
         if not medusa_model_path:
             raise ValueError(
                 "MEDUSA_MODEL_PATH env var must be set when SPEC_MODE=medusa"
@@ -183,18 +182,20 @@ def bench():
 
     # Warmup pass so kernel compilation/setup does not pollute benchmark timing.
     warmup_n = min(warmup_seqs, num_seqs)
-    llm.generate(prompts[:warmup_n], sampling_params[:warmup_n], use_tqdm=False)
-    torch.cuda.synchronize()
+    with torch.profiler.record_function("bench.warmup"):
+        llm.generate(prompts[:warmup_n], sampling_params[:warmup_n], use_tqdm=False)
+        torch.cuda.synchronize()
     print("Warmup done")
 
     print("Staring benchmark")
     # snapshot spec counters so warmup's drafts don't leak into the benchmark
     drafts_before = llm.spec_drafts_total
     accepted_before = llm.spec_accepted_total
-    t = time.time()
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
-    torch.cuda.synchronize()
-    t = time.time() - t
+    with torch.profiler.record_function("bench.benchmark"):
+        t = time.time()
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+        torch.cuda.synchronize()
+        t = time.time() - t
 
     total_tokens = sum(len(out["token_ids"]) for out in outputs)
     throughput = total_tokens / t

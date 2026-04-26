@@ -29,8 +29,11 @@ Usage:
     # Run example with custom model and revision
     modal run run_modal.py --target example --main-model "Qwen/Qwen3-0.6B" --main-revision "main"
 
-    # Profile full bench.py execution (CPU + CUDA) and save trace JSON to Modal volume
+    # Profile full bench.py execution (CPU-only by default) and save trace JSON to Modal volume
     modal run run_modal.py --target bench --profile
+
+    # Include CUDA activity events too (larger trace, slower export)
+    modal run run_modal.py --target bench --profile --profile-cuda
 
     # Profile with eager kernels (no CUDA graph replay)
     modal run run_modal.py --target bench --profile --enforce-eager
@@ -50,6 +53,8 @@ Profiling flags:
         Record tensor shapes for profiled ops.
     --profile-memory
         Record memory usage events.
+    --profile-cuda
+        Include CUDA activity events in the trace (disabled by default).
     # --profile-with-stack (disabled)
     #     Record Python stack traces for events; useful for attribution but slower.
     #     Disabled due to deadlocks/stalls during profiling finalization/export.
@@ -64,6 +69,7 @@ from pathlib import Path
 from uuid import uuid4
 import sys
 import modal
+import shutil
 
 app = modal.App("nano-vllm-runner")
 
@@ -189,6 +195,7 @@ def run_target(
     profile_label: str = "",
     profile_record_shapes: bool = True,
     profile_memory: bool = False,
+    profile_cuda: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
     bench_num_seqs: int = 64,
@@ -247,8 +254,11 @@ def run_target(
     #     profile_with_stack = False
 
     print("Target: ", target)
-    print(f"Spec: mode={spec_mode_norm} length={spec_length if spec_mode_norm == 'naive' else '-'}")
+    print(
+        f"Spec: mode={spec_mode_norm} length={spec_length if spec_mode_norm == 'naive' else '-'}"
+    )
     print(f"Profiler: enabled={profile}")
+    print(f"Profiler: cuda_events={profile_cuda}")
     print(f"Enforce eager: {enforce_eager}")
 
     main_repo = main_model or "Qwen/Qwen3-8B"
@@ -335,11 +345,12 @@ def run_target(
     output_dir.mkdir(parents=True, exist_ok=True)
     trace_path = output_dir / "trace.pt.trace.json"
 
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if profile_cuda:
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
     with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
+        activities=activities,
         record_shapes=profile_record_shapes,
         profile_memory=profile_memory,
         # with_stack=profile_with_stack,
@@ -349,7 +360,11 @@ def run_target(
 
     torch.cuda.synchronize()
     print(f"Exporting profiler trace to {trace_path}...")
-    prof.export_chrome_trace(str(trace_path))
+    # prof.export_chrome_trace(str(trace_path))
+    prof.export_chrome_trace("/tmp/run.trace.pt.trace.json")
+    print("Finished exporting, copying to modal volume...")
+    _ = shutil.copy("/tmp/run.trace.pt.trace.json", str(trace_path))
+    print("Finished copying, committing to modal volume...")
     trace_volume.commit()
     print(f"Profiler trace saved to modal volume: {trace_path}")
 
@@ -373,6 +388,7 @@ def main(
     profile_label: str = "",
     profile_record_shapes: bool = True,
     profile_memory: bool = False,
+    profile_cuda: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
     bench_num_seqs: int = 64,
@@ -422,6 +438,7 @@ def main(
             profile_label,
             profile_record_shapes,
             profile_memory,
+            profile_cuda,
             # profile_with_stack,
             enforce_eager,
             bench_num_seqs,
