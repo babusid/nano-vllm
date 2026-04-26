@@ -233,6 +233,7 @@ def run_target(
     print("Target: ", target)
     print(f"Spec: mode={spec_mode_norm} length={spec_length}")
     print(f"Profiler: enabled={profile}")
+    print(f"Memory profiler: enabled={memory_profile}")
     print(f"Enforce eager: {enforce_eager}")
 
     main_repo = main_model or "Qwen/Qwen3-8B"
@@ -300,15 +301,36 @@ def run_target(
     if not os.path.isfile(script_path):
         script_path = f"/{script_name}"
 
+    output_dir = None
+    if profile or memory_profile:
+        profile_tag = (profile_label.strip() or target).replace("/", "-")
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        run_id = uuid4().hex[:8]
+        output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    if memory_profile:
+        snapshot_path = output_dir / "memory_snapshot.pickle"
+        os.environ["MEMORY_PROFILE"] = "1"
+        os.environ["MEMORY_PROFILE_PATH"] = str(snapshot_path)
+        os.environ["MEMORY_PROFILE_MAX_ENTRIES"] = str(memory_profile_max_entries)
+        print(
+            f"Memory profiler: snapshot -> {snapshot_path} "
+            f"(max_entries={memory_profile_max_entries})"
+        )
+
     if not profile:
-        runpy.run_path(script_path, run_name="__main__")
+        try:
+            runpy.run_path(script_path, run_name="__main__")
+        finally:
+            if memory_profile:
+                trace_volume.commit()
+                print(
+                    f"Memory snapshot committed to modal volume: "
+                    f"{output_dir / 'memory_snapshot.pickle'}"
+                )
         return
 
-    profile_tag = (profile_label.strip() or target).replace("/", "-")
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    run_id = uuid4().hex[:8]
-    output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
     trace_path = output_dir / "trace.pt.trace.json"
 
     with torch.profiler.profile(
@@ -325,6 +347,11 @@ def run_target(
     prof.export_chrome_trace(str(trace_path))
     trace_volume.commit()
     print(f"Profiler trace saved to modal volume: {trace_path}")
+    if memory_profile:
+        print(
+            f"Memory snapshot saved to modal volume: "
+            f"{output_dir / 'memory_snapshot.pickle'}"
+        )
 
 
 @app.local_entrypoint()

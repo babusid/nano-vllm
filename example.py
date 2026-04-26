@@ -6,8 +6,10 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.config import Config
 from transformers import AutoTokenizer
 from nanovllm.engine.llm_engine import SpeculationMode
+from nanovllm.utils.memory_profiler import memory_profiled
 
 
+@memory_profiled
 def example():
     sampling_seed = int(os.environ.get("EXAMPLE_SEED", "0"))
     print("Sampling seed: ", sampling_seed)

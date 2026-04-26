@@ -8,6 +8,7 @@ import torch
 from nanovllm import LLM, SamplingParams
 from nanovllm.config import Config
 from nanovllm.engine.llm_engine import SpeculationMode
+from nanovllm.utils.memory_profiler import memory_profiled
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ def _build_llm(
 # ---------------------------------------------------------------------------
 
 
+@memory_profiled
 def bench_arc():
     num_examples = int(os.environ.get("ARC_NUM_EXAMPLES", "200"))
     warmup_examples = int(os.environ.get("ARC_WARMUP_EXAMPLES", "16"))
