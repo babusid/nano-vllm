@@ -332,6 +332,7 @@ class LLMEngine:
         tree_indices = buffers["tree_indices"]  # [medusa_len] CUDA
         medusa_len = buffers["medusa_len"]
         eos = self.model_config.eos
+        block_size = self.model_config.kvcache_block_size
 
         # ---- Prefill ----
         if is_prefill:
@@ -418,25 +419,50 @@ class LLMEngine:
         # ── [7] Gather the accepted cartesian paths (still on GPU) ──────────
         chosen_paths = cart_candidates[batch_idx, best_candidate]  # [B, depth+1]
 
-        # ── [8] Batched KV scatter for accepted paths ────────────────────────
-        # Keep accepted-path slot calculation on GPU; Python only consumes the
-        # final token decisions below for scheduler/postprocess bookkeeping.
-        chosen_nodes = retrieve_indices[best_candidate]  # [B, depth+1]
-        runner.call("copy_accepted_kv_slots_medusa", seqs, chosen_nodes, accept_length)
+        # Single GPU→CPU sync for all scheduling decisions this step.
+        best_cand_cpu = best_candidate.cpu().tolist()
+        accept_len_cpu = accept_length.cpu().tolist()
+        chosen_paths_cpu = chosen_paths.cpu().tolist()
+        bonus_tokens_cpu = bonus_tokens.cpu().tolist()
+        # retrieve_indices is constant across steps; .cpu() once and cache.
+        if not hasattr(self, "_retrieve_indices_cpu"):
+            self._retrieve_indices_cpu = retrieve_indices.cpu().tolist()
+        retrieve_cpu = self._retrieve_indices_cpu
 
-        # ── [9] Batched bonus pass (all seqs, still GPU-driven) ──────────────
-        # EOS sequences will be discarded during Python bookkeeping below; doing
-        # the full batch here avoids a pre-bonus GPU→CPU sync for filtering.
-        lm_seed, head_seed = runner.call(
-            "run_medusa_bonus_batch", seqs, bonus_tokens, accept_length
-        )
+        # ── [8] Batched KV scatter for accepted paths ────────────────────────
+        # Tree node i was stored at slot old_committed + i (unique per node).
+        # Accepted path's nodes must move to sequential slots old_committed,
+        # old_committed+1, … so the next step's prefix attention is correct.
+        # Skip nodes already at the right slot (root is always 0==0).
+        src_flat: list[int] = []
+        dst_flat: list[int] = []
+        committed_lens = [len(s) for s in seqs]
+        for b in range(B):
+            old = committed_lens[b]
+            bt = seqs[b].block_table
+            accept_len_b = accept_len_cpu[b]
+            nodes = retrieve_cpu[best_cand_cpu[b]][: accept_len_b + 1]
+            for step, tree_idx in enumerate(nodes):
+                if tree_idx == step:
+                    continue
+                src_lp = old + tree_idx
+                dst_lp = old + step
+                src_flat.append(
+                    bt[src_lp // block_size] * block_size + src_lp % block_size
+                )
+                dst_flat.append(
+                    bt[dst_lp // block_size] * block_size + dst_lp % block_size
+                )
+        if src_flat:
+            runner.call("copy_accepted_kv_slots_batched", src_flat, dst_flat)
 
         # ── Build final per-seq token lists, deciding bonus eligibility ─────
         out_tokens: list[list[int]] = []
+        continuing: list[int] = []  # seq indices that should receive a bonus pass
         total_accepted = 0
         for b in range(B):
-            accept_len_b = accept_length[b].item()
-            accepted = [chosen_paths[b, j].item() for j in range(accept_len_b + 1)]
+            accept_len_b = accept_len_cpu[b]
+            accepted = chosen_paths_cpu[b][: accept_len_b + 1]
             total_accepted += accept_len_b
             if eos in accepted:
                 # Sequence will finish — skip bonus pass to avoid a post-EOS token.
@@ -444,10 +470,25 @@ class LLMEngine:
                 seqs[b].medusa_lm_logits = None
                 seqs[b].medusa_head_logits = None
             else:
-                bonus_token_b = bonus_tokens[b].item()
-                out_tokens.append(accepted + [bonus_token_b])
-                seqs[b].medusa_lm_logits = lm_seed[b : b + 1].unsqueeze(1)  # [1,1,V]
-                seqs[b].medusa_head_logits = head_seed[:, b : b + 1].unsqueeze(
+                out_tokens.append(accepted + [bonus_tokens_cpu[b]])
+                continuing.append(b)
+
+        # ── [9] Batched bonus pass for continuing seqs (single decode forward) ──
+        if continuing:
+            cs = [seqs[i] for i in continuing]
+            bonus_pos = [committed_lens[i] + accept_len_cpu[i] + 1 for i in continuing]
+            bonus_tok = [bonus_tokens_cpu[i] for i in continuing]
+            lm_seed, head_seed = runner.call(
+                "run_medusa_decode_batch",
+                cs,
+                bonus_tok,
+                bonus_pos,
+                [p + 1 for p in bonus_pos],
+            )
+            # lm_seed: [C, V]      head_seed: [H, C, V]
+            for j, i in enumerate(continuing):
+                seqs[i].medusa_lm_logits = lm_seed[j : j + 1].unsqueeze(1)  # [1,1,V]
+                seqs[i].medusa_head_logits = head_seed[:, j : j + 1].unsqueeze(
                     2
                 )  # [H,1,1,V]
 
