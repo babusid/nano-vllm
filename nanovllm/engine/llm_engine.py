@@ -19,6 +19,7 @@ from nanovllm.engine.medusa_utils import (
     generate_candidates,
     evaluate_posterior,
     mc_sim_7b_63,
+    vicuna_33b_heads2_fast,
 )
 
 
@@ -65,7 +66,12 @@ class LLMEngine:
         # and Scheduler (for KV slot reservation).
         medusa_buffers: dict | None = None
         if speculation_mode is SpeculationMode.MEDUSA:
-            choices = medusa_choices if medusa_choices is not None else mc_sim_7b_63
+            if medusa_choices is not None:
+                choices = medusa_choices
+            elif medusa_num_heads <= 2:
+                choices = vicuna_33b_heads2_fast
+            else:
+                choices = mc_sim_7b_63
             # Clip the tree to paths compatible with the available number of heads.
             # At depth d (path length d), generate_candidates maps those nodes to
             # flat-candidate indices  cur[-1] + TOPK * (d-1) + 1.  The flat vector
@@ -425,28 +431,12 @@ class LLMEngine:
             "run_medusa_bonus_batch", seqs, bonus_tokens, accept_length
         )
 
-        # Single GPU→CPU sync for scheduler/postprocess decisions this step.
-        # We pack the tensors needed by Python bookkeeping so we only
-        # materialize one host transfer in the hot path.
-        packed = torch.cat(
-            [
-                accept_length.unsqueeze(1),
-                bonus_tokens.unsqueeze(1),
-                chosen_paths,
-            ],
-            dim=1,
-        )
-        packed_cpu = packed.cpu().tolist()
-        path_width = chosen_paths.size(1)
-
         # ── Build final per-seq token lists, deciding bonus eligibility ─────
         out_tokens: list[list[int]] = []
         total_accepted = 0
         for b in range(B):
-            row = packed_cpu[b]
-            accept_len_b = row[0]
-            bonus_token_b = row[1]
-            accepted = row[2 : 2 + path_width][: accept_len_b + 1]
+            accept_len_b = accept_length[b].item()
+            accepted = [chosen_paths[b, j].item() for j in range(accept_len_b + 1)]
             total_accepted += accept_len_b
             if eos in accepted:
                 # Sequence will finish — skip bonus pass to avoid a post-EOS token.
@@ -454,6 +444,7 @@ class LLMEngine:
                 seqs[b].medusa_lm_logits = None
                 seqs[b].medusa_head_logits = None
             else:
+                bonus_token_b = bonus_tokens[b].item()
                 out_tokens.append(accepted + [bonus_token_b])
                 seqs[b].medusa_lm_logits = lm_seed[b : b + 1].unsqueeze(1)  # [1,1,V]
                 seqs[b].medusa_head_logits = head_seed[:, b : b + 1].unsqueeze(

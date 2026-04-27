@@ -30,34 +30,156 @@ TOPK = 10  # number of top-k tokens sampled per Medusa head per depth level
 
 # General-purpose 63-node tree (model-agnostic, good default)
 mc_sim_7b_63 = [
-    [0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3],
-    [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7],
-    [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9],
-    [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4],
-    [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0],
-    [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4],
-    [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0],
-    [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6],
+    [0],
+    [0, 0],
+    [1],
+    [0, 1],
+    [2],
+    [0, 0, 0],
+    [1, 0],
+    [0, 2],
+    [3],
+    [0, 3],
+    [4],
+    [0, 4],
+    [2, 0],
+    [0, 5],
+    [0, 0, 1],
+    [5],
+    [0, 6],
+    [6],
+    [0, 7],
+    [0, 1, 0],
+    [1, 1],
+    [7],
+    [0, 8],
+    [0, 0, 2],
+    [3, 0],
+    [0, 9],
+    [8],
+    [9],
+    [1, 0, 0],
+    [0, 2, 0],
+    [1, 2],
+    [0, 0, 3],
+    [4, 0],
+    [2, 1],
+    [0, 0, 4],
+    [0, 0, 5],
+    [0, 0, 0, 0],
+    [0, 1, 1],
+    [0, 0, 6],
+    [0, 3, 0],
+    [5, 0],
+    [1, 3],
+    [0, 0, 7],
+    [0, 0, 8],
+    [0, 0, 9],
+    [6, 0],
+    [0, 4, 0],
+    [1, 4],
+    [7, 0],
+    [0, 1, 2],
+    [2, 0, 0],
+    [3, 1],
+    [2, 2],
+    [8, 0],
+    [0, 5, 0],
+    [1, 5],
+    [1, 0, 1],
+    [0, 2, 1],
+    [9, 0],
+    [0, 6, 0],
+    [0, 0, 0, 1],
+    [1, 6],
     [0, 7, 0],
 ]
 
 # Vicuna-7B stage-2 optimised topology (63 paths)
 vicuna_7b_stage2 = [
-    (0,), (0, 0), (1,), (0, 1), (0, 0, 0), (1, 0), (2,), (0, 2),
-    (0, 0, 1), (0, 3), (3,), (0, 1, 0), (2, 0), (4,), (0, 0, 2),
-    (0, 4), (1, 1), (1, 0, 0), (0, 0, 0, 0), (5,), (0, 0, 3), (0, 5),
-    (0, 2, 0), (3, 0), (0, 1, 1), (0, 6), (6,), (0, 7), (0, 0, 4),
-    (4, 0), (1, 2), (0, 8), (7,), (0, 3, 0), (0, 0, 0, 1), (0, 0, 5),
-    (2, 1), (0, 0, 6), (1, 0, 1), (0, 0, 1, 0), (2, 0, 0), (5, 0),
-    (0, 9), (0, 1, 2), (8,), (0, 4, 0), (0, 2, 1), (1, 3), (0, 0, 7),
-    (0, 0, 0, 2), (0, 0, 8), (1, 1, 0), (0, 1, 0, 0), (6, 0), (9,),
-    (0, 1, 3), (0, 0, 0, 3), (1, 0, 2), (0, 5, 0), (3, 1), (0, 0, 2, 0),
-    (7, 0), (1, 4),
+    (0,),
+    (0, 0),
+    (1,),
+    (0, 1),
+    (0, 0, 0),
+    (1, 0),
+    (2,),
+    (0, 2),
+    (0, 0, 1),
+    (0, 3),
+    (3,),
+    (0, 1, 0),
+    (2, 0),
+    (4,),
+    (0, 0, 2),
+    (0, 4),
+    (1, 1),
+    (1, 0, 0),
+    (0, 0, 0, 0),
+    (5,),
+    (0, 0, 3),
+    (0, 5),
+    (0, 2, 0),
+    (3, 0),
+    (0, 1, 1),
+    (0, 6),
+    (6,),
+    (0, 7),
+    (0, 0, 4),
+    (4, 0),
+    (1, 2),
+    (0, 8),
+    (7,),
+    (0, 3, 0),
+    (0, 0, 0, 1),
+    (0, 0, 5),
+    (2, 1),
+    (0, 0, 6),
+    (1, 0, 1),
+    (0, 0, 1, 0),
+    (2, 0, 0),
+    (5, 0),
+    (0, 9),
+    (0, 1, 2),
+    (8,),
+    (0, 4, 0),
+    (0, 2, 1),
+    (1, 3),
+    (0, 0, 7),
+    (0, 0, 0, 2),
+    (0, 0, 8),
+    (1, 1, 0),
+    (0, 1, 0, 0),
+    (6, 0),
+    (9,),
+    (0, 1, 3),
+    (0, 0, 0, 3),
+    (1, 0, 2),
+    (0, 5, 0),
+    (3, 1),
+    (0, 0, 2, 0),
+    (7, 0),
+    (1, 4),
+]
+
+# Small two-head tree for high-batch-throughput MEDUSA runs.  The 63-choice
+# defaults still leave 33-38 choices after clipping to two heads, which makes
+# tree decode verify far more candidates than a weak/low-acceptance head pair
+# can justify.  This keeps the most likely one-token branches and a few depth-2
+# continuations while cutting medusa_len from 39 to 7 for the default topology.
+vicuna_33b_heads2_fast = [
+    (0,),
+    (1,),
+    (2,),
+    (0, 0),
+    (0, 1),
+    (1, 0),
 ]
 
 # ---------------------------------------------------------------------------
 # ResBlock (Medusa head building block)
 # ---------------------------------------------------------------------------
+
 
 class ResBlock(nn.Module):
     """Single residual block used inside each Medusa head.
@@ -102,7 +224,9 @@ class MedusaBlock(nn.Module):
 _MEDUSA_HEAD_KEY = re.compile(r"^(\d+)\.(\d+)\.")
 
 
-def remap_medusa_lm_head_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def remap_medusa_lm_head_state_dict(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     """Map flat ``medusa_lm_head.pt`` keys into :class:`MedusaBlock` layout.
 
     HuggingFace / Medusa checkpoints use ``{head_idx}.{seq_idx}.…`` (one
@@ -127,6 +251,7 @@ def remap_medusa_lm_head_state_dict(state: dict[str, torch.Tensor]) -> dict[str,
 # ---------------------------------------------------------------------------
 # Buffer generation (called once at engine init)
 # ---------------------------------------------------------------------------
+
 
 def _pad_path(path: list, length: int, pad_value: int = -2) -> list:
     return path + [pad_value] * (length - len(path))
@@ -171,8 +296,7 @@ def generate_medusa_buffers(
             if len(cur) == 1:
                 continue
             ancestor_idx = [
-                sorted_choices.index(cur[: c + 1]) + 1
-                for c in range(len(cur) - 1)
+                sorted_choices.index(cur[: c + 1]) + 1 for c in range(len(cur) - 1)
             ]
             attn_mask[start + j + 1, ancestor_idx] = 1
         start += count
@@ -217,7 +341,10 @@ def generate_medusa_buffers(
     # Shift by 1 (root is index 0 in the tree) and prepend a column of zeros
     retrieve_indices = retrieve_indices + 1
     retrieve_indices = torch.cat(
-        [torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices],
+        [
+            torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long),
+            retrieve_indices,
+        ],
         dim=1,
     )
 
@@ -228,38 +355,42 @@ def generate_medusa_buffers(
         "retrieve_indices": retrieve_indices,
         "medusa_len": medusa_len,
     }
-    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in buffers.items()}
+    return {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in buffers.items()
+    }
 
 
 # ---------------------------------------------------------------------------
 # Candidate generation (called every decode step on CPU/CUDA)
 # ---------------------------------------------------------------------------
 
+
 def _get_typical_one_token_batched(
-    logit: torch.Tensor,          # [B, vocab]
+    logit: torch.Tensor,  # [B, vocab]
     temperature: float,
     posterior_threshold: float,
     posterior_alpha: float,
-) -> torch.Tensor:                # [B, 1]
+) -> torch.Tensor:  # [B, 1]
     # Upcast to fp32: at very low temperature (e.g. 1e-4) `logit / temperature`
     # trivially overflows fp16 (max 65504) and produces +inf, which causes
     # softmax to return NaN and multinomial to raise a device-side assert.
     logit = logit.float() / temperature
-    probs = torch.softmax(logit, dim=-1)                                   # [B, V]
-    entropy = -torch.sum(probs * torch.log(probs + 1e-5), dim=-1)          # [B]
+    probs = torch.softmax(logit, dim=-1)  # [B, V]
+    entropy = -torch.sum(probs * torch.log(probs + 1e-5), dim=-1)  # [B]
     threshold = torch.minimum(
         torch.ones_like(entropy) * posterior_threshold,
         torch.exp(-entropy) * posterior_alpha,
-    )                                                                       # [B]
+    )  # [B]
     logit = logit.masked_fill(probs < threshold.unsqueeze(-1), float("-inf"))
-    return torch.multinomial(F.softmax(logit, dim=-1), 1)                  # [B, 1]
+    return torch.multinomial(F.softmax(logit, dim=-1), 1)  # [B, 1]
 
 
 def _get_nucleus_one_token_batched(
-    logit: torch.Tensor,          # [B, vocab]
+    logit: torch.Tensor,  # [B, vocab]
     temperature: float,
     top_p: float,
-) -> torch.Tensor:                # [B, 1]
+) -> torch.Tensor:  # [B, 1]
     # fp32 upcast — same overflow concern as _get_typical_one_token_batched.
     logit = logit.float()
     if top_p >= 1:
@@ -316,7 +447,7 @@ def generate_candidates(
         if sampling == "typical":
             candidates_logit = _get_typical_one_token_batched(
                 logits[:, -1], temperature, posterior_threshold, posterior_alpha
-            )                                                                   # [B, 1]
+            )  # [B, 1]
         elif sampling == "nucleus":
             candidates_logit = _get_nucleus_one_token_batched(
                 logits[:, -1], temperature, top_p
@@ -335,11 +466,13 @@ def generate_candidates(
     tree_candidates = candidates[:, tree_indices]
 
     # Extend with a pad column of zeros so retrieve_indices == -? safely indexes 0.
-    pad = torch.zeros(
-        B, 1, dtype=tree_candidates.dtype, device=tree_candidates.device
-    )
-    tree_candidates_ext = torch.cat([tree_candidates, pad], dim=-1)            # [B, medusa_len + 1]
-    cart_candidates = tree_candidates_ext[:, retrieve_indices]                  # [B, num_paths, depth+1]
+    pad = torch.zeros(B, 1, dtype=tree_candidates.dtype, device=tree_candidates.device)
+    tree_candidates_ext = torch.cat(
+        [tree_candidates, pad], dim=-1
+    )  # [B, medusa_len + 1]
+    cart_candidates = tree_candidates_ext[
+        :, retrieve_indices
+    ]  # [B, num_paths, depth+1]
 
     return cart_candidates, tree_candidates
 
@@ -347,6 +480,7 @@ def generate_candidates(
 # ---------------------------------------------------------------------------
 # Posterior evaluation (called every decode step on CPU/CUDA)
 # ---------------------------------------------------------------------------
+
 
 def evaluate_posterior(
     logits: torch.Tensor,
@@ -375,9 +509,11 @@ def evaluate_posterior(
     if temperature == 0:
         posterior_mask = (
             candidates[:, :, 1:] == torch.argmax(logits[:, :, :-1], dim=-1)
-        ).int()                                                        # [B, P, D]
-        accept_len_per_path = torch.cumprod(posterior_mask, dim=-1).sum(dim=-1)  # [B, P]
-        accept_length = accept_len_per_path.max(dim=-1).values         # [B]
+        ).int()  # [B, P, D]
+        accept_len_per_path = torch.cumprod(posterior_mask, dim=-1).sum(
+            dim=-1
+        )  # [B, P]
+        accept_length = accept_len_per_path.max(dim=-1).values  # [B]
         best_candidate = accept_len_per_path.argmax(dim=-1).to(torch.long)  # [B]
         return best_candidate, accept_length
 
@@ -385,37 +521,43 @@ def evaluate_posterior(
     if sampling == "typical" and fast:
         # fp32 upcast: avoids overflow at low temperature (logit / 1e-4 easily
         # exceeds fp16 range and yields NaN probabilities).
-        posterior_prob = torch.softmax(logits[:, :, :-1].float() / temperature, dim=-1)  # [B, P, D, V]
+        posterior_prob = torch.softmax(
+            logits[:, :, :-1].float() / temperature, dim=-1
+        )  # [B, P, D, V]
         candidates_prob = torch.gather(
             posterior_prob, dim=-1, index=candidates[:, :, 1:].unsqueeze(-1)
-        ).squeeze(-1)                                                            # [B, P, D]
+        ).squeeze(
+            -1
+        )  # [B, P, D]
         posterior_entropy = -torch.sum(
             posterior_prob * torch.log(posterior_prob + 1e-5), dim=-1
-        )                                                                         # [B, P, D]
+        )  # [B, P, D]
         threshold = torch.minimum(
             torch.ones_like(posterior_entropy) * posterior_threshold,
             torch.exp(-posterior_entropy) * posterior_alpha,
         )
-        posterior_mask = (candidates_prob > threshold).int()                      # [B, P, D]
-        accept_len_per_path = torch.cumprod(posterior_mask, dim=-1).sum(dim=-1)   # [B, P]
-        accept_length = accept_len_per_path.max(dim=-1).values                    # [B]
+        posterior_mask = (candidates_prob > threshold).int()  # [B, P, D]
+        accept_len_per_path = torch.cumprod(posterior_mask, dim=-1).sum(
+            dim=-1
+        )  # [B, P]
+        accept_length = accept_len_per_path.max(dim=-1).values  # [B]
 
         # For seqs with nonzero accept_length, pick the path with the highest
         # joint log-prob among those achieving the max length. For seqs with
         # zero, best_candidate is unused downstream (accept_length = 0 short-
         # circuits to "commit only the bonus token"), so argmax of all-zero
         # lengths returning 0 is fine.
-        is_max = accept_len_per_path == accept_length.unsqueeze(-1)               # [B, P]
+        is_max = accept_len_per_path == accept_length.unsqueeze(-1)  # [B, P]
         # log-prob sum up to the accept length; pad past accept_length with 0.
-        log_prob = torch.log(candidates_prob.clamp_min(1e-9))                     # [B, P, D]
+        log_prob = torch.log(candidates_prob.clamp_min(1e-9))  # [B, P, D]
         depth = log_prob.size(-1)
-        pos = torch.arange(depth, device=log_prob.device)                         # [D]
-        valid = pos.unsqueeze(0) < accept_length.unsqueeze(-1)                    # [B, D]
-        masked_log_prob = log_prob * valid.unsqueeze(1).float()                   # [B, P, D]
-        likelihood = masked_log_prob.sum(dim=-1)                                   # [B, P]
+        pos = torch.arange(depth, device=log_prob.device)  # [D]
+        valid = pos.unsqueeze(0) < accept_length.unsqueeze(-1)  # [B, D]
+        masked_log_prob = log_prob * valid.unsqueeze(1).float()  # [B, P, D]
+        likelihood = masked_log_prob.sum(dim=-1)  # [B, P]
         # Penalize non-max paths by -inf so argmax selects among is_max paths.
         likelihood = likelihood.masked_fill(~is_max, float("-inf"))
-        best_candidate = likelihood.argmax(dim=-1).to(torch.long)                 # [B]
+        best_candidate = likelihood.argmax(dim=-1).to(torch.long)  # [B]
         return best_candidate, accept_length
 
     raise NotImplementedError(
