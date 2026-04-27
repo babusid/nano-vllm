@@ -171,8 +171,8 @@ class Attention(nn.Module):
             q_4d,
             k_cache,
             v_cache,
-            cache_seqlens=context.prefix_lens,       # [B]
-            block_table=context.block_tables,        # [B, max_bt]
+            cache_seqlens=context.prefix_lens,  # [B]
+            block_table=context.block_tables,  # [B, max_bt]
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,
@@ -181,29 +181,29 @@ class Attention(nn.Module):
 
         # --- Part 2: tree-to-tree attention via dense matmul ---
         # Reshape for [B, H, medusa_len, D] matmuls.  Expand kv heads for GQA.
-        q_h = q.view(B, medusa_len, H, D).permute(0, 2, 1, 3)                  # [B, H, L, D]
-        k_h = k.view(B, medusa_len, Hkv, D).permute(0, 2, 3, 1)                # [B, Hkv, D, L]
-        v_h = v.view(B, medusa_len, Hkv, D).permute(0, 2, 1, 3)                # [B, Hkv, L, D]
+        q_h = q.view(B, medusa_len, H, D).permute(0, 2, 1, 3)  # [B, H, L, D]
+        k_h = k.view(B, medusa_len, Hkv, D).permute(0, 2, 3, 1)  # [B, Hkv, D, L]
+        v_h = v.view(B, medusa_len, Hkv, D).permute(0, 2, 1, 3)  # [B, Hkv, L, D]
         if kv_groups > 1:
-            k_h = k_h.repeat_interleave(kv_groups, dim=1)                      # [B, H, D, L]
-            v_h = v_h.repeat_interleave(kv_groups, dim=1)                      # [B, H, L, D]
+            k_h = k_h.repeat_interleave(kv_groups, dim=1)  # [B, H, D, L]
+            v_h = v_h.repeat_interleave(kv_groups, dim=1)  # [B, H, L, D]
 
         # Attention scores [B, H, L, L] with tree mask (broadcasts over B and H)
         scores = torch.matmul(q_h, k_h) * self.scale
-        scores = scores + context.medusa_tree_mask                             # [1,1,L,L]
+        scores = scores + context.medusa_tree_mask  # [1,1,L,L]
 
         # LSE and weighted output for tree part
-        lse_t = torch.logsumexp(scores.float(), dim=-1)                        # [B, H, L]
+        lse_t = torch.logsumexp(scores.float(), dim=-1)  # [B, H, L]
         attn_w = torch.softmax(scores.float(), dim=-1).to(v_h.dtype)
-        out_t = torch.matmul(attn_w, v_h)                                       # [B, H, L, D]
+        out_t = torch.matmul(attn_w, v_h)  # [B, H, L, D]
 
         # --- Combine via online log-sum-exp ---
-        lse_c = torch.logaddexp(lse_p.float(), lse_t)                          # [B, H, L]
-        w_p = (lse_p.float() - lse_c).exp().unsqueeze(-1)                      # [B, H, L, 1]
-        w_t = (lse_t          - lse_c).exp().unsqueeze(-1)
+        lse_c = torch.logaddexp(lse_p.float(), lse_t)  # [B, H, L]
+        w_p = (lse_p.float() - lse_c).exp().unsqueeze(-1)  # [B, H, L, 1]
+        w_t = (lse_t - lse_c).exp().unsqueeze(-1)
 
-        out_p_h = out_p.permute(0, 2, 1, 3)                                    # [B, H, L, D]
-        out_combined = w_p * out_p_h + w_t * out_t                              # [B, H, L, D]
+        out_p_h = out_p.permute(0, 2, 1, 3)  # [B, H, L, D]
+        out_combined = w_p * out_p_h + w_t * out_t  # [B, H, L, D]
 
         # Cast back to the original query dtype (e.g. float16) before returning.
         # w_p / w_t are computed in float32 for numerical stability, which

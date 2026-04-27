@@ -1,5 +1,8 @@
 import atexit
+import csv
 from dataclasses import fields
+import os
+import time
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -172,13 +175,22 @@ class LLMEngine:
             )
 
         # setup scheduler with access to all block managers
+        medusa_reserve_tokens = None
+        if medusa_buffers is not None:
+            # MEDUSA can commit up to one full retrieved path plus one bonus token
+            # per step; reserve enough KV slots for that worst case.
+            medusa_reserve_tokens = max(
+                medusa_buffers["medusa_len"],
+                int(medusa_buffers["retrieve_indices"].size(1)) + 1,
+            )
+
         self.scheduler = Scheduler(
             config=model_config,
             block_managers=self.block_managers,
             speculation_mode=self.speculation_mode,
             speculator_config=self.speculator_config,
             speculation_length=self.speculation_length,
-            medusa_len=medusa_buffers["medusa_len"] if medusa_buffers else None,
+            medusa_len=medusa_reserve_tokens,
         )
 
         # running acceptance stats for spec-dec modes
@@ -540,6 +552,22 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        capture_throughput = os.environ.get("CAPTURE_THROUGHPUT_TRACE", "0") == "1"
+        throughput_path = os.environ.get("THROUGHPUT_TRACE_PATH", "/tmp/data.csv")
+        throughput_file = None
+        throughput_writer = None
+        cumulative_generated_tokens = 0
+        if capture_throughput:
+            throughput_file = open(throughput_path, "w", newline="", encoding="utf-8")
+            throughput_writer = csv.writer(throughput_file)
+            throughput_writer.writerow(
+                [
+                    "timestamp",
+                    "prefill_tput_tok_s",
+                    "decode_tput_tok_s",
+                    "total_generated_tokens",
+                ]
+            )
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
@@ -548,36 +576,50 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.0
-        idx = 0
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens, step_drafts, step_accepted = self.step()
-            # accumulate spec metrics regardless of use_tqdm — caller dumps
-            # aggregates (see bench.py). -1 sentinel = prefill or non-spec.
-            if step_drafts > 0:
-                self.spec_drafts_total += step_drafts
-                self.spec_accepted_total += step_accepted
-            if use_tqdm:
+        try:
+            while not self.is_finished():
+                t = perf_counter()
+                output, num_tokens, step_drafts, step_accepted = self.step()
+                elapsed = perf_counter() - t
+                # accumulate spec metrics regardless of use_tqdm — caller dumps
+                # aggregates (see bench.py). -1 sentinel = prefill or non-spec.
+                if step_drafts > 0:
+                    self.spec_drafts_total += step_drafts
+                    self.spec_accepted_total += step_accepted
+
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                    decode_throughput = 0
+                    prefill_throughput = num_tokens / elapsed
+                    decode_throughput = 0.0
                 else:
-                    prefill_throughput = 0
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix(
-                    {
-                        "Prefill": f"{int(prefill_throughput)}tok/s",
-                        "Decode": f"{int(decode_throughput)}tok/s",
-                    }
-                )
-                idx += 1
-                print(
-                    f"Step {idx}: Prefill {prefill_throughput:.2f}tok/s, Decode {decode_throughput:.2f}tok/s\n"
-                )
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+                    prefill_throughput = 0.0
+                    decode_throughput = -num_tokens / elapsed
+                    cumulative_generated_tokens += -num_tokens
+
+                if throughput_writer is not None:
+                    throughput_writer.writerow(
+                        [
+                            time.time(),
+                            f"{prefill_throughput:.6f}",
+                            f"{decode_throughput:.6f}",
+                            cumulative_generated_tokens,
+                        ]
+                    )
+                    throughput_file.flush()
+
                 if use_tqdm:
-                    pbar.update(1)
+                    pbar.set_postfix(
+                        {
+                            "Prefill": f"{int(prefill_throughput)}tok/s",
+                            "Decode": f"{int(decode_throughput)}tok/s",
+                        }
+                    )
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    if use_tqdm:
+                        pbar.update(1)
+        finally:
+            if throughput_file is not None:
+                throughput_file.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [
             {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}

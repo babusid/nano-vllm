@@ -177,10 +177,7 @@ class Scheduler:
                 token_ids = token_ids[: eos_idx + 1]
             seq.extend(token_ids)
             if (
-                (
-                    not seq.ignore_eos
-                    and token_ids[-1] == self.eos
-                )
+                (not seq.ignore_eos and token_ids[-1] == self.eos)
                 or seq.num_completion_tokens >= seq.max_tokens
                 or len(seq) >= self.max_model_len
             ):

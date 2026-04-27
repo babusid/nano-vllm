@@ -38,6 +38,9 @@ Usage:
     # Profile with eager kernels (no CUDA graph replay)
     modal run run_modal.py --target bench --profile --enforce-eager
 
+    # Capture per-step prefill/decode throughput CSV
+    modal run run_modal.py --target bench --data-capture
+
     # Disabled (can deadlock): Python stack traces in profiler events
     # modal run run_modal.py --target bench --profile --profile-with-stack
 
@@ -60,6 +63,8 @@ Profiling flags:
     #     Disabled due to deadlocks/stalls during profiling finalization/export.
     --enforce-eager
         Disable CUDA graph replay during execution (independent of --profile).
+    --data-capture / --trace-throughput
+        Capture per-step throughput metrics into data.csv on the Modal trace volume.
 """
 
 from __future__ import annotations
@@ -196,6 +201,8 @@ def run_target(
     profile_cuda: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
+    data_capture: bool = False,
+    trace_throughput: bool = False,
     bench_num_seqs: int = 64,
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
@@ -258,6 +265,12 @@ def run_target(
     print(f"Profiler: enabled={profile}")
     print(f"Profiler: cuda_events={profile_cuda}")
     print(f"Enforce eager: {enforce_eager}")
+    throughput_capture_enabled = data_capture or trace_throughput
+    throughput_tmp_path = "/tmp/data.csv"
+    print(f"Throughput trace: enabled={throughput_capture_enabled}")
+    os.environ["CAPTURE_THROUGHPUT_TRACE"] = "1" if throughput_capture_enabled else "0"
+    if throughput_capture_enabled:
+        os.environ["THROUGHPUT_TRACE_PATH"] = throughput_tmp_path
 
     main_repo = main_model or "Qwen/Qwen3-8B"
     os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
@@ -332,39 +345,55 @@ def run_target(
     if not os.path.isfile(script_path):
         script_path = f"/{script_name}"
 
-    if not profile:
-        runpy.run_path(script_path, run_name="__main__")
-        return
-
     profile_tag = (profile_label.strip() or target).replace("/", "-")
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     run_id = uuid4().hex[:8]
-    output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = output_dir / "trace.pt.trace.json"
+    output_dir = None
+    if profile or throughput_capture_enabled:
+        output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if profile_cuda:
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-    with torch.profiler.profile(
-        activities=activities,
-        record_shapes=profile_record_shapes,
-        profile_memory=profile_memory,
-        # with_stack=profile_with_stack,
-        with_stack=False,
-    ) as prof:
+    wrote_artifact = False
+    if not profile:
         runpy.run_path(script_path, run_name="__main__")
+    else:
+        trace_path = output_dir / "trace.pt.trace.json"
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if profile_cuda:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-    torch.cuda.synchronize()
-    print(f"Exporting profiler trace to {trace_path}...")
-    # prof.export_chrome_trace(str(trace_path))
-    prof.export_chrome_trace("/tmp/run.trace.pt.trace.json")
-    print("Finished exporting, copying to modal volume...")
-    _ = shutil.copy("/tmp/run.trace.pt.trace.json", str(trace_path))
-    print("Finished copying, committing to modal volume...")
-    trace_volume.commit()
-    print(f"Profiler trace saved to modal volume: {trace_path}")
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=profile_record_shapes,
+            profile_memory=profile_memory,
+            # with_stack=profile_with_stack,
+            with_stack=False,
+        ) as prof:
+            runpy.run_path(script_path, run_name="__main__")
+
+        torch.cuda.synchronize()
+        print(f"Exporting profiler trace to {trace_path}...")
+        # prof.export_chrome_trace(str(trace_path))
+        prof.export_chrome_trace("/tmp/run.trace.pt.trace.json")
+        print("Finished exporting, copying to modal volume...")
+        _ = shutil.copy("/tmp/run.trace.pt.trace.json", str(trace_path))
+        print(f"Profiler trace saved to modal volume: {trace_path}")
+        wrote_artifact = True
+
+    if throughput_capture_enabled:
+        data_path = output_dir / "data.csv"
+        if not os.path.isfile(throughput_tmp_path):
+            raise FileNotFoundError(
+                f"Throughput trace requested but no file found at {throughput_tmp_path}"
+            )
+        _ = shutil.copy(throughput_tmp_path, str(data_path))
+        print(f"Throughput data saved to modal volume: {data_path}")
+        wrote_artifact = True
+
+    if wrote_artifact:
+        print("Committing artifacts to modal volume...")
+        trace_volume.commit()
+        print(f"Artifacts committed under {output_dir}")
 
 
 @app.local_entrypoint()
@@ -387,6 +416,8 @@ def main(
     profile_cuda: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
+    data_capture: bool = False,
+    trace_throughput: bool = False,
     bench_num_seqs: int = 64,
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
@@ -435,6 +466,8 @@ def main(
             profile_cuda,
             # profile_with_stack,
             enforce_eager,
+            data_capture,
+            trace_throughput,
             bench_num_seqs,
             bench_max_input_len,
             bench_max_output_len,

@@ -883,9 +883,14 @@ class ModelRunner:
         slot_list = []
         for seq, p in zip(seqs, positions):
             bt = self._block_table(seq)
-            slot_list.append(
-                bt[p // self.block_size] * self.block_size + (p % self.block_size)
-            )
+            block_idx = p // self.block_size
+            if block_idx >= len(bt):
+                raise RuntimeError(
+                    "Insufficient KV reservation for MEDUSA decode batch: "
+                    f"position={p}, required_block_idx={block_idx}, "
+                    f"allocated_blocks={len(bt)}"
+                )
+            slot_list.append(bt[block_idx] * self.block_size + (p % self.block_size))
         slot_t = torch.tensor(slot_list, dtype=torch.int32, pin_memory=True).cuda(
             non_blocking=True
         )
