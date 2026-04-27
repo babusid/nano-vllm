@@ -21,7 +21,7 @@ Usage:
     modal run run_modal.py --target bench --spec-mode naive --spec-length 8
 
     # Run benchmark with MEDUSA speculative decoding
-    modal run run_modal.py --target bench --spec-mode medusa --medusa-model "FasterDecoding/medusa-vicuna-7b-v1.3"
+    modal run run_modal.py --target bench --spec-mode medusa --spec-model "FasterDecoding/medusa-vicuna-7b-v1.3"
 
     # Run benchmark with custom models
     modal run run_modal.py --target bench --main-model "Qwen/Qwen3-8B" --spec-model "Qwen/Qwen3-0.6B"
@@ -186,8 +186,6 @@ def run_target(
     spec_mode: str = "none",
     spec_length: int = 1,
     # MEDUSA-specific
-    medusa_model: str = "",
-    medusa_revision: str = "",
     medusa_choices: str = "",
     medusa_num_heads: int = 4,
     medusa_num_layers: int = 1,
@@ -204,7 +202,7 @@ def run_target(
     bench_seed: int = 0,
     bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
-    bench_max_num_seqs: int = 512,
+    bench_max_batch_size: int = 512,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
@@ -243,8 +241,8 @@ def run_target(
         )
     if spec_length < 1:
         raise ValueError(f"spec_length must be >= 1, got {spec_length}")
-    if spec_mode_norm == "medusa" and not medusa_model:
-        raise ValueError("--medusa-model is required when --spec-mode medusa")
+    if spec_mode_norm == "medusa" and not spec_model:
+        raise ValueError("--spec-model is required when --spec-mode medusa")
     # if profile and profile_with_stack and not enforce_eager:
     #     print(
     #         "Profiler warning: disabling --profile-with-stack in CUDA graph mode "
@@ -269,7 +267,7 @@ def run_target(
         spec_repo = spec_model or "Qwen/Qwen3-0.6B"
         os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
     elif spec_mode_norm == "medusa":
-        os.environ["MEDUSA_MODEL_PATH"] = _download_model(medusa_model, medusa_revision)
+        os.environ["MEDUSA_MODEL_PATH"] = _download_model(spec_model, spec_revision)
         if medusa_choices:
             os.environ["MEDUSA_CHOICES"] = medusa_choices
         os.environ["MEDUSA_NUM_HEADS"] = str(medusa_num_heads)
@@ -286,7 +284,7 @@ def run_target(
         os.environ["BENCH_SEED"] = str(bench_seed)
         os.environ["BENCH_TEMPERATURE"] = str(bench_temperature)
         os.environ["BENCH_WARMUP_SEQS"] = str(bench_warmup_seqs)
-        os.environ["BENCH_MAX_NUM_SEQS"] = str(bench_max_num_seqs)
+        os.environ["BENCH_MAX_BATCH_SIZE"] = str(bench_max_batch_size)
         os.environ["BENCH_MAIN_MAX_MODEL_LEN"] = str(bench_main_max_model_len)
         os.environ["BENCH_MAIN_GPU_MEMORY_UTILIZATION"] = str(
             bench_main_gpu_memory_utilization
@@ -374,13 +372,11 @@ def main(
     target: str = "bench",
     main_model: str = "Qwen/Qwen3-8B",
     main_revision: str = "",
-    spec_model: str = "Qwen/Qwen3-0.6B",
+    spec_model: str = "",
     spec_revision: str = "",
     spec_mode: str = "none",
     spec_length: int = 1,
     # MEDUSA-specific
-    medusa_model: str = "",
-    medusa_revision: str = "",
     medusa_choices: str = "",
     medusa_num_heads: int = 4,
     medusa_num_layers: int = 1,
@@ -397,7 +393,7 @@ def main(
     bench_seed: int = 0,
     bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
-    bench_max_num_seqs: int = 512,
+    bench_max_batch_size: int = 512,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
@@ -429,8 +425,6 @@ def main(
             spec_revision,
             spec_mode,
             spec_length,
-            medusa_model,
-            medusa_revision,
             medusa_choices,
             medusa_num_heads,
             medusa_num_layers,
@@ -447,7 +441,7 @@ def main(
             bench_seed,
             bench_temperature,
             bench_warmup_seqs,
-            bench_max_num_seqs,
+            bench_max_batch_size,
             bench_main_max_model_len,
             bench_main_gpu_memory_utilization,
             bench_spec_max_model_len,
