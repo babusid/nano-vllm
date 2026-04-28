@@ -71,10 +71,8 @@ class LLMEngine:
         if speculation_mode is SpeculationMode.MEDUSA:
             if medusa_choices is not None:
                 choices = medusa_choices
-            elif medusa_num_heads <= 2:
-                choices = vicuna_33b_heads2_fast
             else:
-                choices = mc_sim_7b_63
+                choices = vicuna_33b_heads2_fast
             # Clip the tree to paths compatible with the available number of heads.
             # At depth d (path length d), generate_candidates maps those nodes to
             # flat-candidate indices  cur[-1] + TOPK * (d-1) + 1.  The flat vector
