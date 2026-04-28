@@ -610,6 +610,10 @@ class LLMEngine:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / elapsed
                     decode_throughput = 0.0
+                    # Prefill emits one completion token per active sequence.
+                    # Include these so CSV total_generated_tokens matches
+                    # bench.py's final output-token accounting.
+                    cumulative_generated_tokens += step_batch_size
                 else:
                     prefill_throughput = 0.0
                     decode_throughput = -num_tokens / elapsed
