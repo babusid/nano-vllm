@@ -43,11 +43,9 @@ DEFAULT_STATE_DIR = REPO_ROOT / "modal_throughput_ablations"
 
 MAIN_MODEL = "lmsys/vicuna-33b-v1.3"
 SPEC_MODEL = "Jiayi-Pan/Tiny-Vicuna-1B"
-# BATCH_SIZES = (2, 4, 16, 32, 64, 128)
-# SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5)
 
-BATCH_SIZES = (64, 128)
-SPEC_LENGTHS_NAIVE = (1, 2)
+BATCH_SIZES = (2, 4, 16, 32, 64, 128)
+SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5)
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -64,6 +62,7 @@ def _build_none_jobs() -> list[tuple[str, list[str]]]:
         cmd = [
             "modal",
             "run",
+            "--detach",
             "run_modal.py",
             "--target",
             "bench",
@@ -95,6 +94,7 @@ def _build_naive_jobs() -> list[tuple[str, list[str]]]:
             cmd = [
                 "modal",
                 "run",
+                "--detach",
                 "run_modal.py",
                 "--target",
                 "bench",
