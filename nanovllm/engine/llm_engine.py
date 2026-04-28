@@ -21,7 +21,6 @@ from nanovllm.engine.medusa_utils import (
     generate_medusa_buffers,
     generate_candidates,
     evaluate_posterior,
-    mc_sim_7b_63,
     vicuna_33b_heads2_fast,
 )
 
@@ -71,10 +70,8 @@ class LLMEngine:
         if speculation_mode is SpeculationMode.MEDUSA:
             if medusa_choices is not None:
                 choices = medusa_choices
-            elif medusa_num_heads <= 2:
-                choices = vicuna_33b_heads2_fast
             else:
-                choices = mc_sim_7b_63
+                choices = vicuna_33b_heads2_fast
             # Clip the tree to paths compatible with the available number of heads.
             # At depth d (path length d), generate_candidates maps those nodes to
             # flat-candidate indices  cur[-1] + TOPK * (d-1) + 1.  The flat vector
@@ -613,6 +610,10 @@ class LLMEngine:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / elapsed
                     decode_throughput = 0.0
+                    # Prefill emits one completion token per active sequence.
+                    # Include these so CSV total_generated_tokens matches
+                    # bench.py's final output-token accounting.
+                    cumulative_generated_tokens += step_batch_size
                 else:
                     prefill_throughput = 0.0
                     decode_throughput = -num_tokens / elapsed

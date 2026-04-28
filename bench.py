@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import random
@@ -61,6 +62,68 @@ def load_sharegpt_prompts(
     return prompts, sampling_params
 
 
+def enrich_throughput_csv(
+    path: str,
+    spec_mode: str,
+    bench_max_batch_size: int,
+    spec_len: int,
+    medusa_num_heads: int,
+) -> None:
+    if not os.path.isfile(path):
+        print(f"Throughput CSV not found, skipping enrichment: {path}")
+        return
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        if reader.fieldnames is None:
+            print(f"Throughput CSV has no header, skipping enrichment: {path}")
+            return
+        fieldnames = list(reader.fieldnames)
+
+    extra_columns = [
+        "spec_mode",
+        "bench_max_batch_size",
+        "spec_len",
+        "medusa_num_heads",
+        "mean_tokens_accepted_per_seq",
+        "token_acceptance_pct",
+    ]
+    for col in extra_columns:
+        if col not in fieldnames:
+            fieldnames.append(col)
+
+    for row in rows:
+        row["spec_mode"] = spec_mode
+        row["bench_max_batch_size"] = str(bench_max_batch_size)
+        row["spec_len"] = str(spec_len)
+        row["medusa_num_heads"] = str(medusa_num_heads)
+
+        step_batch_size = int(row.get("step_batch_size", "-1"))
+        step_tokens_accepted = float(row.get("step_tokens_accepted", "-1"))
+        step_tokens_proposed = float(row.get("step_tokens_proposed", "-1"))
+
+        if step_batch_size > 0 and step_tokens_accepted >= 0:
+            mean_tokens_accepted = step_tokens_accepted / step_batch_size
+            row["mean_tokens_accepted_per_seq"] = f"{mean_tokens_accepted:.6f}"
+        else:
+            row["mean_tokens_accepted_per_seq"] = "-1"
+
+        if step_tokens_proposed > 0 and step_tokens_accepted >= 0:
+            row["token_acceptance_pct"] = (
+                f"{(step_tokens_accepted / step_tokens_proposed):.6f}"
+            )
+        else:
+            row["token_acceptance_pct"] = "-1"
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Enriched throughput CSV in place: {path}")
+
+
 def bench():
     dataset_path = os.environ.get(
         "SHAREGPT_PATH", "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -98,6 +161,7 @@ def bench():
     spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
     use_naive = spec_mode_str == "naive"
     use_medusa = spec_mode_str == "medusa"
+    medusa_num_heads = 0
     print(f"Spec: mode={spec_mode_str} length={spec_length if use_naive else '-'}")
 
     # size memory pool to add up to 90% of GPU memory
@@ -142,18 +206,32 @@ def bench():
             speculation_length=spec_length,
         )
     elif use_medusa:
-        import json as _json
+        from nanovllm.engine.medusa_utils import (
+            load_medusa_choices,
+            resolve_medusa_choices_file,
+        )
 
         medusa_model_path = os.path.expanduser(os.environ.get("MEDUSA_MODEL_PATH", ""))
         if not medusa_model_path:
             raise ValueError(
                 "MEDUSA_MODEL_PATH env var must be set when SPEC_MODE=medusa"
             )
-        medusa_choices_str = os.environ.get("MEDUSA_CHOICES", "")
-        medusa_choices = _json.loads(medusa_choices_str) if medusa_choices_str else None
+        medusa_raw = os.environ.get("MEDUSA_CHOICES", "").strip()
+        medusa_file = resolve_medusa_choices_file(medusa_raw)
+        medusa_choices = load_medusa_choices(medusa_raw)
         medusa_num_heads = int(os.environ.get("MEDUSA_NUM_HEADS", "4"))
         medusa_num_layers = int(os.environ.get("MEDUSA_NUM_LAYERS", "1"))
         print("MEDUSA Model Path: ", medusa_model_path)
+        if medusa_choices is not None:
+            if medusa_file:
+                print(
+                    f"MEDUSA_CHOICES (file {medusa_file!r}, env={medusa_raw!r}): "
+                    f"{len(medusa_choices)} paths"
+                )
+            else:
+                print(f"MEDUSA_CHOICES (inline JSON): {len(medusa_choices)} paths")
+        else:
+            print("MEDUSA_CHOICES: (unset) using built-in default tree")
         spec_kwargs = dict(
             speculation_mode=SpeculationMode.MEDUSA,
             medusa_model_path=medusa_model_path,
@@ -210,6 +288,18 @@ def bench():
             f"Spec: drafted={drafts}tok, accepted={accepted}tok, "
             f"acceptance={rate:.2%}"
         )
+
+    capture_throughput = os.environ.get("CAPTURE_THROUGHPUT_TRACE", "0") == "1"
+    throughput_path = os.environ.get("THROUGHPUT_TRACE_PATH", "/tmp/data.csv")
+    if capture_throughput:
+        enrich_throughput_csv(
+            path=throughput_path,
+            spec_mode=spec_mode_str,
+            bench_max_batch_size=max_batch_size,
+            spec_len=spec_length if use_naive else 0,
+            medusa_num_heads=medusa_num_heads if use_medusa else 0,
+        )
+
     print("Benchmark done")
 
 

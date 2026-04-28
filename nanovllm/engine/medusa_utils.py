@@ -12,6 +12,8 @@ Sources:
   medusa_repo/Medusa/medusa/model/medusa_choices.py (default topologies)
 """
 
+import json
+import os
 import re
 
 import torch
@@ -24,143 +26,62 @@ import torch.nn.functional as F
 
 TOPK = 10  # number of top-k tokens sampled per Medusa head per depth level
 
+# Repo root (parent of ``nanovllm/``) so relative paths work when CWD is not the repo.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _medusa_choices_file_candidates(spec: str) -> list[str]:
+    """Paths to try for a tree JSON file (Modal / bench CWD may vary)."""
+    out = [spec, os.path.join(os.getcwd(), spec), os.path.join(_REPO_ROOT, spec)]
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def resolve_medusa_choices_file(spec: str) -> str | None:
+    """Return the absolute/normalized path opened for ``spec``, or ``None`` if no file matches."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    for path in _medusa_choices_file_candidates(spec):
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+    return None
+
+
+def load_medusa_choices(spec: str) -> list | None:
+    """Parse ``MEDUSA_CHOICES`` into a list of paths.
+
+    * If ``spec`` is empty → ``None`` (caller uses built-in default).
+    * If ``spec`` resolves to an existing file (tries CWD, then repo root) →
+      load JSON (must be a JSON array of integer paths).
+    * Otherwise → parse ``spec`` as JSON (legacy inline JSON string).
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    resolved = resolve_medusa_choices_file(spec)
+    if resolved is not None:
+        with open(resolved, encoding="utf-8") as f:
+            return json.load(f)
+    try:
+        return json.loads(spec)
+    except json.JSONDecodeError as e:
+        tried = ", ".join(repr(p) for p in _medusa_choices_file_candidates(spec))
+        raise ValueError(
+            "MEDUSA_CHOICES is not a readable JSON file and is not valid JSON. "
+            f"Tried paths: {tried}. JSON error: {e}"
+        ) from e
+
+
 # ---------------------------------------------------------------------------
 # Default tree topologies (ported from medusa_choices.py)
 # ---------------------------------------------------------------------------
-
-# General-purpose 63-node tree (model-agnostic, good default)
-mc_sim_7b_63 = [
-    [0],
-    [0, 0],
-    [1],
-    [0, 1],
-    [2],
-    [0, 0, 0],
-    [1, 0],
-    [0, 2],
-    [3],
-    [0, 3],
-    [4],
-    [0, 4],
-    [2, 0],
-    [0, 5],
-    [0, 0, 1],
-    [5],
-    [0, 6],
-    [6],
-    [0, 7],
-    [0, 1, 0],
-    [1, 1],
-    [7],
-    [0, 8],
-    [0, 0, 2],
-    [3, 0],
-    [0, 9],
-    [8],
-    [9],
-    [1, 0, 0],
-    [0, 2, 0],
-    [1, 2],
-    [0, 0, 3],
-    [4, 0],
-    [2, 1],
-    [0, 0, 4],
-    [0, 0, 5],
-    [0, 0, 0, 0],
-    [0, 1, 1],
-    [0, 0, 6],
-    [0, 3, 0],
-    [5, 0],
-    [1, 3],
-    [0, 0, 7],
-    [0, 0, 8],
-    [0, 0, 9],
-    [6, 0],
-    [0, 4, 0],
-    [1, 4],
-    [7, 0],
-    [0, 1, 2],
-    [2, 0, 0],
-    [3, 1],
-    [2, 2],
-    [8, 0],
-    [0, 5, 0],
-    [1, 5],
-    [1, 0, 1],
-    [0, 2, 1],
-    [9, 0],
-    [0, 6, 0],
-    [0, 0, 0, 1],
-    [1, 6],
-    [0, 7, 0],
-]
-
-# Vicuna-7B stage-2 optimised topology (63 paths)
-vicuna_7b_stage2 = [
-    (0,),
-    (0, 0),
-    (1,),
-    (0, 1),
-    (0, 0, 0),
-    (1, 0),
-    (2,),
-    (0, 2),
-    (0, 0, 1),
-    (0, 3),
-    (3,),
-    (0, 1, 0),
-    (2, 0),
-    (4,),
-    (0, 0, 2),
-    (0, 4),
-    (1, 1),
-    (1, 0, 0),
-    (0, 0, 0, 0),
-    (5,),
-    (0, 0, 3),
-    (0, 5),
-    (0, 2, 0),
-    (3, 0),
-    (0, 1, 1),
-    (0, 6),
-    (6,),
-    (0, 7),
-    (0, 0, 4),
-    (4, 0),
-    (1, 2),
-    (0, 8),
-    (7,),
-    (0, 3, 0),
-    (0, 0, 0, 1),
-    (0, 0, 5),
-    (2, 1),
-    (0, 0, 6),
-    (1, 0, 1),
-    (0, 0, 1, 0),
-    (2, 0, 0),
-    (5, 0),
-    (0, 9),
-    (0, 1, 2),
-    (8,),
-    (0, 4, 0),
-    (0, 2, 1),
-    (1, 3),
-    (0, 0, 7),
-    (0, 0, 0, 2),
-    (0, 0, 8),
-    (1, 1, 0),
-    (0, 1, 0, 0),
-    (6, 0),
-    (9,),
-    (0, 1, 3),
-    (0, 0, 0, 3),
-    (1, 0, 2),
-    (0, 5, 0),
-    (3, 1),
-    (0, 0, 2, 0),
-    (7, 0),
-    (1, 4),
-]
 
 # Small two-head tree for high-batch-throughput MEDUSA runs.  The 63-choice
 # defaults still leave 33-38 choices after clipping to two heads, which makes

@@ -74,7 +74,11 @@ def example():
             speculation_length=spec_length,
         )
     elif use_medusa:
-        import json as _json
+        from nanovllm.engine.medusa_utils import (
+            load_medusa_choices,
+            resolve_medusa_choices_file,
+        )
+
         medusa_model_path = os.path.expanduser(
             os.environ.get("MEDUSA_MODEL_PATH", "")
         )
@@ -82,11 +86,22 @@ def example():
             raise ValueError(
                 "MEDUSA_MODEL_PATH env var must be set when SPEC_MODE=medusa"
             )
-        medusa_choices_str = os.environ.get("MEDUSA_CHOICES", "")
-        medusa_choices = _json.loads(medusa_choices_str) if medusa_choices_str else None
+        medusa_raw = os.environ.get("MEDUSA_CHOICES", "").strip()
+        medusa_file = resolve_medusa_choices_file(medusa_raw)
+        medusa_choices = load_medusa_choices(medusa_raw)
         medusa_num_heads = int(os.environ.get("MEDUSA_NUM_HEADS", "4"))
         medusa_num_layers = int(os.environ.get("MEDUSA_NUM_LAYERS", "1"))
         print("MEDUSA Model Path: ", medusa_model_path)
+        if medusa_choices is not None:
+            if medusa_file:
+                print(
+                    f"MEDUSA_CHOICES (file {medusa_file!r}, env={medusa_raw!r}): "
+                    f"{len(medusa_choices)} paths"
+                )
+            else:
+                print(f"MEDUSA_CHOICES (inline JSON): {len(medusa_choices)} paths")
+        else:
+            print("MEDUSA_CHOICES: (unset) using built-in default tree")
         spec_kwargs = dict(
             speculation_mode=SpeculationMode.MEDUSA,
             medusa_model_path=medusa_model_path,
