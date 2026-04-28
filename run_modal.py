@@ -191,6 +191,7 @@ def run_target(
     spec_mode: str = "none",
     spec_length: int = 1,
     # MEDUSA-specific
+    # JSON array of paths, or a path to a .json file (see load_medusa_choices).
     medusa_choices: str = "",
     medusa_num_heads: int = 4,
     medusa_num_layers: int = 1,
@@ -406,6 +407,7 @@ def main(
     spec_mode: str = "none",
     spec_length: int = 1,
     # MEDUSA-specific
+    # JSON array of paths, or a path to a .json file (see load_medusa_choices).
     medusa_choices: str = "",
     medusa_num_heads: int = 4,
     medusa_num_layers: int = 1,

@@ -12,6 +12,8 @@ Sources:
   medusa_repo/Medusa/medusa/model/medusa_choices.py (default topologies)
 """
 
+import json
+import os
 import re
 
 import torch
@@ -23,6 +25,59 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 TOPK = 10  # number of top-k tokens sampled per Medusa head per depth level
+
+# Repo root (parent of ``nanovllm/``) so relative paths work when CWD is not the repo.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _medusa_choices_file_candidates(spec: str) -> list[str]:
+    """Paths to try for a tree JSON file (Modal / bench CWD may vary)."""
+    out = [spec, os.path.join(os.getcwd(), spec), os.path.join(_REPO_ROOT, spec)]
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def resolve_medusa_choices_file(spec: str) -> str | None:
+    """Return the absolute/normalized path opened for ``spec``, or ``None`` if no file matches."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    for path in _medusa_choices_file_candidates(spec):
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+    return None
+
+
+def load_medusa_choices(spec: str) -> list | None:
+    """Parse ``MEDUSA_CHOICES`` into a list of paths.
+
+    * If ``spec`` is empty → ``None`` (caller uses built-in default).
+    * If ``spec`` resolves to an existing file (tries CWD, then repo root) →
+      load JSON (must be a JSON array of integer paths).
+    * Otherwise → parse ``spec`` as JSON (legacy inline JSON string).
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    resolved = resolve_medusa_choices_file(spec)
+    if resolved is not None:
+        with open(resolved, encoding="utf-8") as f:
+            return json.load(f)
+    try:
+        return json.loads(spec)
+    except json.JSONDecodeError as e:
+        tried = ", ".join(repr(p) for p in _medusa_choices_file_candidates(spec))
+        raise ValueError(
+            "MEDUSA_CHOICES is not a readable JSON file and is not valid JSON. "
+            f"Tried paths: {tried}. JSON error: {e}"
+        ) from e
+
 
 # ---------------------------------------------------------------------------
 # Default tree topologies (ported from medusa_choices.py)

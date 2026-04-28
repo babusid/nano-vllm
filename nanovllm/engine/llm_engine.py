@@ -21,7 +21,6 @@ from nanovllm.engine.medusa_utils import (
     generate_medusa_buffers,
     generate_candidates,
     evaluate_posterior,
-    mc_sim_7b_63,
     vicuna_33b_heads2_fast,
 )
 
