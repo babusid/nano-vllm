@@ -32,8 +32,11 @@ Usage:
     # Profile with eager kernels (no CUDA graph replay)
     modal run run_modal.py --target bench --profile --enforce-eager
 
-    # Disabled (can deadlock): Python stack traces in profiler events
-    # modal run run_modal.py --target bench --profile --profile-with-stack
+    # Record CUDA allocator history for the whole benchmark run
+    modal run run_modal.py --target bench --memory-profile
+
+    # Combine torch profiler + memory snapshot in the same run
+    modal run run_modal.py --target bench --profile --memory-profile
 
     # Pull traces locally
     modal volume get nano-vllm-profiler-traces / ./traces
@@ -43,13 +46,14 @@ Profiling flags:
         Enable full-script PyTorch profiling and export a .pt.trace.json file.
     --profile-label
         Optional output trace label used in the trace directory name.
-    --profile-record-shapes
-        Record tensor shapes for profiled ops.
     --profile-memory
-        Record memory usage events.
-    # --profile-with-stack (disabled)
-    #     Record Python stack traces for events; useful for attribution but slower.
-    #     Disabled due to deadlocks/stalls during profiling finalization/export.
+        Record memory usage events in the torch.profiler trace.
+    --memory-profile
+        Record CUDA allocator history (torch.cuda.memory._record_memory_history)
+        for the entire target run and dump a memory_snapshot.pickle file
+        viewable at https://pytorch.org/memory_viz.
+    --memory-profile-max-entries
+        Allocation-event ring buffer size for --memory-profile (default 100000).
     --enforce-eager
         Disable CUDA graph replay during execution (independent of --profile).
 """
@@ -178,9 +182,9 @@ def run_target(
     spec_length: int = 1,
     profile: bool = False,
     profile_label: str = "",
-    profile_record_shapes: bool = True,
     profile_memory: bool = False,
-    # profile_with_stack: bool = False,
+    memory_profile: bool = False,
+    memory_profile_max_entries: int = 100000,
     enforce_eager: bool = False,
     bench_num_seqs: int = 64,
     bench_max_input_len: int = 1024,
@@ -226,17 +230,10 @@ def run_target(
         )
     if spec_length < 1:
         raise ValueError(f"spec_length must be >= 1, got {spec_length}")
-    # if profile and profile_with_stack and not enforce_eager:
-    #     print(
-    #         "Profiler warning: disabling --profile-with-stack in CUDA graph mode "
-    #         "(known to stall during trace finalization). Use --enforce-eager "
-    #         "if you need Python stacks."
-    #     )
-    #     profile_with_stack = False
-
     print("Target: ", target)
     print(f"Spec: mode={spec_mode_norm} length={spec_length}")
     print(f"Profiler: enabled={profile}")
+    print(f"Memory profiler: enabled={memory_profile}")
     print(f"Enforce eager: {enforce_eager}")
 
     main_repo = main_model or "Qwen/Qwen3-8B"
@@ -304,15 +301,36 @@ def run_target(
     if not os.path.isfile(script_path):
         script_path = f"/{script_name}"
 
+    output_dir = None
+    if profile or memory_profile:
+        profile_tag = (profile_label.strip() or target).replace("/", "-")
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        run_id = uuid4().hex[:8]
+        output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    if memory_profile:
+        snapshot_path = output_dir / "memory_snapshot.pickle"
+        os.environ["MEMORY_PROFILE"] = "1"
+        os.environ["MEMORY_PROFILE_PATH"] = str(snapshot_path)
+        os.environ["MEMORY_PROFILE_MAX_ENTRIES"] = str(memory_profile_max_entries)
+        print(
+            f"Memory profiler: snapshot -> {snapshot_path} "
+            f"(max_entries={memory_profile_max_entries})"
+        )
+
     if not profile:
-        runpy.run_path(script_path, run_name="__main__")
+        try:
+            runpy.run_path(script_path, run_name="__main__")
+        finally:
+            if memory_profile:
+                trace_volume.commit()
+                print(
+                    f"Memory snapshot committed to modal volume: "
+                    f"{output_dir / 'memory_snapshot.pickle'}"
+                )
         return
 
-    profile_tag = (profile_label.strip() or target).replace("/", "-")
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    run_id = uuid4().hex[:8]
-    output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
     trace_path = output_dir / "trace.pt.trace.json"
 
     with torch.profiler.profile(
@@ -320,10 +338,7 @@ def run_target(
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ],
-        record_shapes=profile_record_shapes,
         profile_memory=profile_memory,
-        # with_stack=profile_with_stack,
-        with_stack=False,
     ) as prof:
         runpy.run_path(script_path, run_name="__main__")
 
@@ -332,6 +347,11 @@ def run_target(
     prof.export_chrome_trace(str(trace_path))
     trace_volume.commit()
     print(f"Profiler trace saved to modal volume: {trace_path}")
+    if memory_profile:
+        print(
+            f"Memory snapshot saved to modal volume: "
+            f"{output_dir / 'memory_snapshot.pickle'}"
+        )
 
 
 @app.local_entrypoint()
@@ -345,9 +365,9 @@ def main(
     spec_length: int = 1,
     profile: bool = False,
     profile_label: str = "",
-    profile_record_shapes: bool = True,
     profile_memory: bool = False,
-    # profile_with_stack: bool = False,
+    memory_profile: bool = False,
+    memory_profile_max_entries: int = 100000,
     enforce_eager: bool = False,
     bench_num_seqs: int = 64,
     bench_max_input_len: int = 1024,
@@ -388,9 +408,9 @@ def main(
             spec_length,
             profile,
             profile_label,
-            profile_record_shapes,
             profile_memory,
-            # profile_with_stack,
+            memory_profile,
+            memory_profile_max_entries,
             enforce_eager,
             bench_num_seqs,
             bench_max_input_len,

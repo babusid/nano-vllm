@@ -6,6 +6,7 @@ from nanovllm.config import Config
 import torch
 from nanovllm import LLM, SamplingParams
 from nanovllm.engine.llm_engine import SpeculationMode
+from nanovllm.utils.memory_profiler import memory_profiled
 
 
 def load_sharegpt_prompts(
@@ -61,6 +62,7 @@ def load_sharegpt_prompts(
     return prompts, sampling_params
 
 
+@memory_profiled
 def bench():
     dataset_path = os.environ.get(
         "SHAREGPT_PATH", "ShareGPT_V3_unfiltered_cleaned_split.json"
