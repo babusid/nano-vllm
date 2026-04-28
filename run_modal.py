@@ -111,7 +111,15 @@ image = (
     .add_local_dir(
         ".",
         remote_path="/workspace",
-        ignore=[".git", "__pycache__", ".venv", "*.pyc"],
+        ignore=[
+            ".git",
+            "__pycache__",
+            ".venv",
+            "*.pyc",
+            # Local ablation scripts write logs here while other `modal run` syncs the tree;
+            # tracking it causes "modified during build process" race errors.
+            "modal_throughput_ablations",
+        ],
     )
 )
 
@@ -246,8 +254,12 @@ def run_target(
         raise ValueError(
             f"spec_mode must be one of ['none', 'naive', 'medusa'], got {spec_mode!r}"
         )
-    if spec_length < 1:
-        raise ValueError(f"spec_length must be >= 1, got {spec_length}")
+    if spec_length < 0:
+        raise ValueError(f"spec_length must be >= 0, got {spec_length}")
+    if spec_length < 1 and spec_mode_norm in {"naive", "medusa"}:
+        raise ValueError(
+            f"spec_length must be >= 1 when spec_mode is naive or medusa, got {spec_length}"
+        )
     if spec_mode_norm == "medusa" and not spec_model:
         raise ValueError("--spec-model is required when --spec-mode medusa")
     # if profile and profile_with_stack and not enforce_eager:
