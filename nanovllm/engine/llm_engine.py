@@ -265,36 +265,46 @@ class LLMEngine:
                     seq_accept = []
                     step_drafts += len(draft_tokens)
                     seq_accepted_drafts = 0
-                    for tok, small, big in zip(
-                        draft_tokens, small_logits, draft_big_logits
-                    ):
-                        # upcast to fp32 — fp16 logits (esp. Vicuna-33B) can
-                        # overflow and poison softmax with inf/nan, which
-                        # propagates into residual and trips multinomial's
-                        # probability-validity assert.
-                        small_prob_dist = small.float().softmax(dim=-1)
-                        big_prob_dist = big.float().softmax(dim=-1)
-                        p_small = small_prob_dist[tok]
-                        p_big = big_prob_dist[tok]
-                        accept = p_big >= p_small
-                        if not accept:
-                            accept = p_big.new_empty(()).uniform_() < (
-                                p_big / (p_small + 1e-12)
-                            )
-                        if accept:
-                            seq_accept.append(tok)
-                            seq_accepted_drafts += 1
-                            continue
-                        residual = (big_prob_dist - small_prob_dist).clamp_min(0)
-                        rsum = residual.sum()
-                        if rsum <= 0 or not torch.isfinite(rsum):
-                            # big ≤ small everywhere (or non-finite): fall
-                            # back to sampling from the target distribution
-                            bonus_token = big_prob_dist.multinomial(1).item()
-                        else:
-                            bonus_token = (residual / rsum).multinomial(1).item()
-                        seq_accept.append(bonus_token)
-                        break
+                    if seq.temperature <= 0:
+                        for tok, big in zip(draft_tokens, draft_big_logits):
+                            verifier_argmax = int(big.argmax(dim=-1).item())
+                            if tok == verifier_argmax:
+                                seq_accept.append(tok)
+                                seq_accepted_drafts += 1
+                                continue
+                            seq_accept.append(verifier_argmax)
+                            break
+                    else:
+                        for tok, small, big in zip(
+                            draft_tokens, small_logits, draft_big_logits
+                        ):
+                            # upcast to fp32 — fp16 logits (esp. Vicuna-33B) can
+                            # overflow and poison softmax with inf/nan, which
+                            # propagates into residual and trips multinomial's
+                            # probability-validity assert.
+                            small_prob_dist = small.float().softmax(dim=-1)
+                            big_prob_dist = big.float().softmax(dim=-1)
+                            p_small = small_prob_dist[tok]
+                            p_big = big_prob_dist[tok]
+                            accept = p_big >= p_small
+                            if not accept:
+                                accept = p_big.new_empty(()).uniform_() < (
+                                    p_big / (p_small + 1e-12)
+                                )
+                            if accept:
+                                seq_accept.append(tok)
+                                seq_accepted_drafts += 1
+                                continue
+                            residual = (big_prob_dist - small_prob_dist).clamp_min(0)
+                            rsum = residual.sum()
+                            if rsum <= 0 or not torch.isfinite(rsum):
+                                # big ≤ small everywhere (or non-finite): fall
+                                # back to sampling from the target distribution
+                                bonus_token = big_prob_dist.multinomial(1).item()
+                            else:
+                                bonus_token = (residual / rsum).multinomial(1).item()
+                            seq_accept.append(bonus_token)
+                            break
                     if seq_accepted_drafts == len(draft_tokens) and draft_tokens:
                         assert len(big_token_ids) == len(draft_tokens) + 1
                         seq_accept.append(big_token_ids[-1])
@@ -509,13 +519,41 @@ class LLMEngine:
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -step_accepted
+        step_batch_size = len(seqs)
+        if is_prefill:
+            step_tokens_proposed = -1
+            step_tokens_accepted = -1
+            num_tokens = sum(len(seq) for seq in seqs)
+        elif self.speculation_mode is SpeculationMode.NONE:
+            step_tokens_proposed = step_batch_size
+            step_tokens_accepted = step_batch_size
+            num_tokens = -step_tokens_accepted
+        elif self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            # Include verifier token in both proposed/accepted accounting.
+            step_tokens_proposed = step_batch_size * (self.speculation_length + 1)
+            step_tokens_accepted = step_batch_size + step_accepted
+            num_tokens = -step_tokens_accepted
+        else:
+            # MEDUSA: proposals are all tree nodes (root + speculative nodes);
+            # accepted adds the root LM-head token to speculative accepts.
+            medusa_len = self.medusa_buffers["medusa_len"]
+            step_tokens_proposed = step_batch_size * medusa_len
+            step_tokens_accepted = step_batch_size + step_accepted
+            num_tokens = -step_tokens_accepted
         # step_drafts/step_accepted are -1 for prefill and non-spec steps so
         # callers can distinguish "no spec this step" from a genuine 0-draft
         # batch. Caller aggregates; see generate() / bench for reporting.
         # TODO: richer metrics — per-step distribution of accepted-run
         # lengths, time spent in drafter vs verifier, etc.
-        return outputs, num_tokens, step_drafts, step_accepted
+        return (
+            outputs,
+            num_tokens,
+            step_drafts,
+            step_accepted,
+            step_batch_size,
+            step_tokens_accepted,
+            step_tokens_proposed,
+        )
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -540,6 +578,9 @@ class LLMEngine:
                     "prefill_tput_tok_s",
                     "decode_tput_tok_s",
                     "total_generated_tokens",
+                    "step_batch_size",
+                    "step_tokens_accepted",
+                    "step_tokens_proposed",
                 ]
             )
         if use_tqdm:
@@ -553,7 +594,15 @@ class LLMEngine:
         try:
             while not self.is_finished():
                 t = perf_counter()
-                output, num_tokens, step_drafts, step_accepted = self.step()
+                (
+                    output,
+                    num_tokens,
+                    step_drafts,
+                    step_accepted,
+                    step_batch_size,
+                    step_tokens_accepted,
+                    step_tokens_proposed,
+                ) = self.step()
                 elapsed = perf_counter() - t
                 # accumulate spec metrics regardless of use_tqdm — caller dumps
                 # aggregates (see bench.py). -1 sentinel = prefill or non-spec.
@@ -576,6 +625,9 @@ class LLMEngine:
                             f"{prefill_throughput:.6f}",
                             f"{decode_throughput:.6f}",
                             cumulative_generated_tokens,
+                            step_batch_size,
+                            step_tokens_accepted,
+                            step_tokens_proposed,
                         ]
                     )
                     throughput_file.flush()
