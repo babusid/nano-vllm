@@ -715,7 +715,6 @@ class ModelRunner:
         medusa_len = self.medusa_len
         medusa_position_ids = self.medusa_buffers["medusa_position_ids"]  # [medusa_len]
 
-        positions_list = []
         slot_list = []
         prefix_list = []
         bt_list = []
@@ -723,9 +722,6 @@ class ModelRunner:
         for seq in seqs:
             block_table = self._block_table(seq)
             committed_len = len(seq)
-            positions_list.append(
-                committed_len + medusa_position_ids
-            )  # [medusa_len] CUDA
             for i in range(medusa_len):
                 token_idx = committed_len + i
                 slot_list.append(
@@ -736,19 +732,24 @@ class ModelRunner:
             bt_list.append(block_table)
 
         tree_tokens = tree_candidates.reshape(B * medusa_len)  # already on CUDA
-        positions = torch.cat(positions_list)  # [B*medusa_len] CUDA
         slot_mapping = torch.tensor(slot_list, dtype=torch.int32, pin_memory=True).cuda(
             non_blocking=True
         )
         prefix_lens = torch.tensor(
             prefix_list, dtype=torch.int32, pin_memory=True
         ).cuda(non_blocking=True)
+        prefix_lens_i64 = prefix_lens.to(torch.int64)
+        positions = (
+            prefix_lens_i64.unsqueeze(1) + medusa_position_ids.unsqueeze(0)
+        ).reshape(B * medusa_len)
         max_bt_len = max((len(bt) for bt in bt_list), default=1)
         block_tables = torch.tensor(
             [bt + [-1] * (max_bt_len - len(bt)) for bt in bt_list],
             dtype=torch.int32,
             pin_memory=True,
         ).cuda(non_blocking=True)
+        self._last_medusa_block_tables = block_tables
+        self._last_medusa_prefix_lens = prefix_lens_i64
 
         set_context(
             False,
@@ -810,6 +811,108 @@ class ModelRunner:
         hd = self.kv_cache.size(5)
         flat = self.kv_cache.view(2, nl, -1, nkv, hd)
         flat[:, :, dst] = flat[:, :, src]
+
+    def copy_accepted_kv_slots_medusa(
+        self,
+        seqs: list,
+        chosen_nodes: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> None:
+        """Copy accepted MEDUSA tree KV slots using GPU-side slot tensors.
+
+        chosen_nodes contains the tree-node indices for the selected candidate
+        path per sequence. Accepted tree nodes are written during tree decode at
+        logical positions old_len + tree_idx, but future decode expects the
+        accepted path packed sequentially at old_len + step.
+        """
+        B, depth = chosen_nodes.shape
+        if B == 0 or depth == 0:
+            return
+
+        device = chosen_nodes.device
+        nodes = chosen_nodes
+        if nodes.dtype is not torch.int64:
+            nodes = nodes.to(torch.int64)
+        if accept_length.dtype is not torch.int64:
+            accept_length = accept_length.to(torch.int64)
+
+        committed = getattr(self, "_last_medusa_prefix_lens", None)
+        block_tables = getattr(self, "_last_medusa_block_tables", None)
+        if committed is None or block_tables is None or committed.size(0) < B:
+            committed = torch.tensor(
+                [len(seq) for seq in seqs], dtype=torch.int64, device=device
+            )
+            block_tables = self.prepare_block_tables(seqs)
+        committed = committed[:B]
+        block_tables = block_tables[:B]
+
+        nl = self.kv_cache.size(1)
+        nkv = self.kv_cache.size(4)
+        hd = self.kv_cache.size(5)
+        flat = self.kv_cache.view(2, nl, -1, nkv, hd)
+
+        for step in range(depth):
+            node = nodes[:, step]
+            dst_lp = committed + step
+            # Avoid boolean indexing here: tensor[bool_mask] lowers through
+            # aten::nonzero, which synchronizes. Non-copy lanes become
+            # harmless self-copies at the sequential destination slot.
+            should_copy = (step <= accept_length) & (node != step)
+            src_lp = committed + torch.where(
+                should_copy, node, node.new_full((B,), step)
+            )
+            src_block = torch.gather(
+                block_tables, 1, (src_lp // self.block_size).unsqueeze(1)
+            ).squeeze(1)
+            dst_block = torch.gather(
+                block_tables, 1, (dst_lp // self.block_size).unsqueeze(1)
+            ).squeeze(1)
+            src_slots = src_block * self.block_size + src_lp % self.block_size
+            dst_slots = dst_block * self.block_size + dst_lp % self.block_size
+            flat[:, :, dst_slots] = flat[:, :, src_slots]
+
+    @torch.inference_mode()
+    def run_medusa_bonus_batch(
+        self,
+        seqs: list,
+        bonus_tokens: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the MEDUSA bonus-token seed pass from CUDA decisions."""
+        B = bonus_tokens.size(0)
+        device = bonus_tokens.device
+        committed = getattr(self, "_last_medusa_prefix_lens", None)
+        block_tables = getattr(self, "_last_medusa_block_tables", None)
+        if committed is None or block_tables is None or committed.size(0) < B:
+            committed = torch.tensor(
+                [len(seq) for seq in seqs], dtype=torch.int64, device=device
+            )
+            block_tables = self.prepare_block_tables(seqs)
+        committed = committed[:B]
+        block_tables = block_tables[:B]
+
+        if accept_length.dtype is not torch.int64:
+            accept_length = accept_length.to(torch.int64)
+        positions = committed + accept_length + 1
+        context_lens = (positions + 1).to(torch.int32)
+        block_idx = (positions // self.block_size).unsqueeze(1)
+        block = torch.gather(block_tables, 1, block_idx).squeeze(1)
+        slot_mapping = (block * self.block_size + positions % self.block_size).to(
+            torch.int32
+        )
+
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+        hidden = self._run_decode_hidden(bonus_tokens, positions)
+        reset_context()
+
+        lm_logits = self.model.compute_logits(hidden)
+        medusa_logits = torch.stack([head(hidden) for head in self.medusa_heads], dim=0)
+        return lm_logits, medusa_logits
 
     @torch.inference_mode()
     def _run_decode_hidden(
