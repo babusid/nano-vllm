@@ -47,9 +47,11 @@ MAIN_MODEL = "lmsys/vicuna-33b-v1.3"
 SPEC_MODEL = "Jiayi-Pan/Tiny-Vicuna-1B"
 MEDUSA_MODEL = "FasterDecoding/medusa-vicuna-33b-v1.3"
 MEDUSA_CONFIG_DIR = REPO_ROOT / "medusa_tree_configs"
-BATCH_SIZES = (2, 4, 16, 32, 64, 128)
-# SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5)
-SPEC_LENGTHS_NAIVE = (32,)
+BENCH_SIZE = 128
+# BATCH_SIZES = (2, 4, 16, 32, 64, 128)
+# BATCH_SIZES = (10, 24, 48, 96)
+BATCH_SIZES = (8,)
+SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5, 32)
 
 
 def _utc_now_iso() -> str:
@@ -63,11 +65,10 @@ def _safe_id(fragment: str) -> str:
 def _build_none_jobs() -> list[tuple[str, list[str]]]:
     jobs: list[tuple[str, list[str]]] = []
     for bs in BATCH_SIZES:
-        label = f"none-bs_{bs}-n128"
+        label = f"none-bs_{bs}-n{BENCH_SIZE}"
         cmd = [
             "modal",
             "run",
-            "--detach",
             "run_modal.py",
             "--target",
             "bench",
@@ -78,7 +79,7 @@ def _build_none_jobs() -> list[tuple[str, list[str]]]:
             "--main-model",
             MAIN_MODEL,
             "--bench-num-seqs",
-            "128",
+            f"{BENCH_SIZE}",
             "--bench-max-batch-size",
             str(bs),  # batch size
             "--bench-warmup-seqs",
@@ -95,11 +96,10 @@ def _build_naive_jobs() -> list[tuple[str, list[str]]]:
     jobs: list[tuple[str, list[str]]] = []
     for sl in SPEC_LENGTHS_NAIVE:
         for bs in BATCH_SIZES:
-            label = f"naive-speclen_{sl}-bs_{bs}-n128"
+            label = f"naive-speclen_{sl}-bs_{bs}-n{BENCH_SIZE}"
             cmd = [
                 "modal",
                 "run",
-                "--detach",
                 "run_modal.py",
                 "--target",
                 "bench",
@@ -110,7 +110,7 @@ def _build_naive_jobs() -> list[tuple[str, list[str]]]:
                 "--spec-model",
                 SPEC_MODEL,
                 "--bench-num-seqs",
-                "128",
+                f"{BENCH_SIZE}",
                 "--bench-max-batch-size",
                 str(bs),  # batch size
                 "--bench-warmup-seqs",
@@ -141,7 +141,7 @@ def _build_medusa_jobs() -> list[tuple[str, list[str]]]:
         c1, c2 = m.group(1), m.group(2)
         medusa_choices = config_path.read_text(encoding="utf-8").strip()
         for bs in BATCH_SIZES:
-            label = f"medusa_bs{bs}_c1_{c1}_c2_{c2}_n128"
+            label = f"medusa_bs{bs}_c1_{c1}_c2_{c2}_n{BENCH_SIZE}"
             cmd = [
                 "modal",
                 "run",
@@ -159,7 +159,7 @@ def _build_medusa_jobs() -> list[tuple[str, list[str]]]:
                 "--medusa-choices",
                 medusa_choices,
                 "--bench-num-seqs",
-                "128",
+                f"{BENCH_SIZE}",
                 "--bench-max-batch-size",
                 str(bs),
                 "--bench-warmup-seqs",
