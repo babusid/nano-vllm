@@ -1,5 +1,7 @@
 import atexit
 import csv
+import json
+from collections import Counter
 from dataclasses import fields
 import os
 import time
@@ -516,6 +518,7 @@ class LLMEngine:
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
+        step_seq_emitted = [len(seq_token_ids) for seq_token_ids in token_ids]
         step_batch_size = len(seqs)
         if is_prefill:
             step_tokens_proposed = -1
@@ -548,6 +551,7 @@ class LLMEngine:
         # lengths, time spent in drafter vs verifier, etc.
         return (
             outputs,
+            step_seq_emitted,
             num_tokens,
             step_drafts,
             step_accepted,
@@ -570,6 +574,8 @@ class LLMEngine:
         throughput_file = None
         throughput_writer = None
         cumulative_generated_tokens = 0
+        decode_len_hist: Counter[int] = Counter()
+        decode_len_samples = 0
         if capture_throughput:
             throughput_file = open(throughput_path, "w", newline="", encoding="utf-8")
             throughput_writer = csv.writer(throughput_file)
@@ -597,6 +603,7 @@ class LLMEngine:
                 t = perf_counter()
                 (
                     output,
+                    step_seq_emitted,
                     num_tokens,
                     step_drafts,
                     step_accepted,
@@ -622,6 +629,11 @@ class LLMEngine:
                     prefill_throughput = 0.0
                     decode_throughput = -num_tokens / elapsed
                     cumulative_generated_tokens += -num_tokens
+                    # Per-sequence decode emission histogram (global over run).
+                    # One contribution per active sequence per decode step.
+                    for emitted in step_seq_emitted:
+                        decode_len_hist[emitted] += 1
+                        decode_len_samples += 1
 
                 if throughput_writer is not None:
                     throughput_writer.writerow(
@@ -651,6 +663,36 @@ class LLMEngine:
         finally:
             if throughput_file is not None:
                 throughput_file.close()
+            if capture_throughput:
+                hist_path = f"{throughput_path}.hist.json"
+                hist_items = sorted(
+                    (int(k), int(v)) for k, v in decode_len_hist.items()
+                )
+                total = sum(k * v for k, v in hist_items)
+                mean = (total / decode_len_samples) if decode_len_samples > 0 else 0.0
+
+                def _quantile_from_hist(q: float) -> int:
+                    if decode_len_samples <= 0:
+                        return 0
+                    target = int((decode_len_samples - 1) * q)
+                    running = 0
+                    for k, v in hist_items:
+                        running += v
+                        if running > target:
+                            return k
+                    return hist_items[-1][0]
+
+                payload = {
+                    "num_samples": decode_len_samples,
+                    "hist": {str(k): v for k, v in hist_items},
+                    "mean": mean,
+                    "median": _quantile_from_hist(0.5),
+                    "p90": _quantile_from_hist(0.9),
+                    "p95": _quantile_from_hist(0.95),
+                    "spec_mode": self.speculation_mode.value,
+                }
+                with open(hist_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [
             {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}

@@ -48,9 +48,7 @@ SPEC_MODEL = "Jiayi-Pan/Tiny-Vicuna-1B"
 MEDUSA_MODEL = "FasterDecoding/medusa-vicuna-33b-v1.3"
 MEDUSA_CONFIG_DIR = REPO_ROOT / "medusa_tree_configs"
 BENCH_SIZE = 128
-# BATCH_SIZES = (2, 4, 16, 32, 64, 128)
-# BATCH_SIZES = (10, 24, 48, 96)
-BATCH_SIZES = (8,)
+BATCH_SIZES = (2, 4, 8, 16, 32, 48, 64, 96, 128)
 SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5, 32)
 
 

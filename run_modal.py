@@ -80,7 +80,7 @@ app = modal.App("nano-vllm-runner")
 
 hf_volume = modal.Volume.from_name("nano-vllm-hf-cache", create_if_missing=True)
 trace_volume = modal.Volume.from_name(
-    "nano-vllm-profiler-traces", create_if_missing=True
+    "nano-vllm-profiler-traces-3", create_if_missing=True
 )
 sharegpt_volume = modal.Volume.from_name("nano-vllm-sharegpt", create_if_missing=True)
 arc_volume = modal.Volume.from_name("nano-vllm-arc", create_if_missing=True)
@@ -401,6 +401,11 @@ def run_target(
             )
         _ = shutil.copy(throughput_tmp_path, str(data_path))
         print(f"Throughput data saved to modal volume: {data_path}")
+        hist_tmp_path = f"{throughput_tmp_path}.hist.json"
+        if os.path.isfile(hist_tmp_path):
+            hist_path = output_dir / "decode_len_hist.json"
+            _ = shutil.copy(hist_tmp_path, str(hist_path))
+            print(f"Decode histogram saved to modal volume: {hist_path}")
         wrote_artifact = True
 
     if wrote_artifact:
