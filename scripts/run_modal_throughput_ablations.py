@@ -24,8 +24,10 @@ Detached runs append child stdout/err to ``<state-dir>/orchestrator.log``.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,9 +45,12 @@ DEFAULT_STATE_DIR = REPO_ROOT / "modal_throughput_ablations"
 
 MAIN_MODEL = "lmsys/vicuna-33b-v1.3"
 SPEC_MODEL = "Jiayi-Pan/Tiny-Vicuna-1B"
-
+MEDUSA_MODEL = "FasterDecoding/medusa-vicuna-33b-v1.3"
+MEDUSA_CONFIG_DIR = REPO_ROOT / "medusa_tree_configs"
 BATCH_SIZES = (2, 4, 16, 32, 64, 128)
-SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5)
+# SPEC_LENGTHS_NAIVE = (1, 2, 3, 4, 5)
+SPEC_LENGTHS_NAIVE = (32,)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -75,7 +80,7 @@ def _build_none_jobs() -> list[tuple[str, list[str]]]:
             "--bench-num-seqs",
             "128",
             "--bench-max-batch-size",
-            str(bs), # batch size
+            str(bs),  # batch size
             "--bench-warmup-seqs",
             "8",
             "--trace-throughput",
@@ -107,17 +112,80 @@ def _build_naive_jobs() -> list[tuple[str, list[str]]]:
                 "--bench-num-seqs",
                 "128",
                 "--bench-max-batch-size",
-                str(bs), # batch size
+                str(bs),  # batch size
                 "--bench-warmup-seqs",
                 "8",
                 "--spec-length",
-                str(sl), # spec length
+                str(sl),  # spec length
                 "--trace-throughput",
                 "--profile-label",
                 label,
             ]
             jobs.append((_safe_id(label), cmd))
     return jobs
+
+
+def _build_medusa_jobs() -> list[tuple[str, list[str]]]:
+    jobs: list[tuple[str, list[str]]] = []
+    if not MEDUSA_CONFIG_DIR.is_dir():
+        raise FileNotFoundError(f"Missing medusa config dir: {MEDUSA_CONFIG_DIR}")
+
+    config_paths = sorted(MEDUSA_CONFIG_DIR.glob("*.json"))
+    if not config_paths:
+        raise ValueError(f"No JSON configs found in {MEDUSA_CONFIG_DIR}")
+
+    for config_path in config_paths:
+        m = re.match(r"^tree_(\d+)_(\d+)\.json$", config_path.name)
+        if m is None:
+            continue
+        c1, c2 = m.group(1), m.group(2)
+        medusa_choices = config_path.read_text(encoding="utf-8").strip()
+        for bs in BATCH_SIZES:
+            label = f"medusa_bs{bs}_c1_{c1}_c2_{c2}_n128"
+            cmd = [
+                "modal",
+                "run",
+                "run_modal.py",
+                "--target",
+                "bench",
+                "--spec-mode",
+                "medusa",
+                "--main-model",
+                MAIN_MODEL,
+                "--spec-model",
+                MEDUSA_MODEL,
+                "--medusa-num-heads",
+                "2",
+                "--medusa-choices",
+                medusa_choices,
+                "--bench-num-seqs",
+                "128",
+                "--bench-max-batch-size",
+                str(bs),
+                "--bench-warmup-seqs",
+                "8",
+                "--trace-throughput",
+                "--profile-label",
+                label,
+            ]
+            jobs.append((_safe_id(label), cmd))
+    return jobs
+
+
+def _apply_job_filters(
+    jobs: list[tuple[str, list[str]]], patterns: list[str] | None
+) -> list[tuple[str, list[str]]]:
+    if not patterns:
+        return jobs
+
+    kept: list[tuple[str, list[str]]] = []
+    for jid, cmd in jobs:
+        cmd_str = shlex_like(cmd)
+        if any(
+            fnmatch.fnmatch(jid, p) or fnmatch.fnmatch(cmd_str, p) for p in patterns
+        ):
+            kept.append((jid, cmd))
+    return kept
 
 
 @dataclass
@@ -220,9 +288,13 @@ def run_orchestration(
     max_parallel: int,
     dry_run: bool,
     only: str | None,
+    job_filter: list[str] | None,
 ) -> int:
     if not _modal_cli_available(modal_bin):
-        print(f"fatal: Modal CLI `{modal_bin}` not found (PATH or invalid file).", file=sys.stderr)
+        print(
+            f"fatal: Modal CLI `{modal_bin}` not found (PATH or invalid file).",
+            file=sys.stderr,
+        )
         return 126
 
     run_modal = REPO_ROOT / "run_modal.py"
@@ -235,6 +307,10 @@ def run_orchestration(
         jobs.extend(_build_none_jobs())
     if only == "naive" or only is None:
         jobs.extend(_build_naive_jobs())
+    if only == "medusa" or only is None:
+        jobs.extend(_build_medusa_jobs())
+
+    jobs = _apply_job_filters(jobs, job_filter)
 
     logs_dir = state_dir / "logs"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -264,6 +340,7 @@ def run_orchestration(
         "total_jobs": len(jobs),
         "modal_bin": modal_bin,
         "modal_exe": modal_exe,
+        "job_filter": job_filter or [],
     }
 
     print(f"State dir: {state_dir}")
@@ -282,7 +359,9 @@ def run_orchestration(
     # Bounded parallel execution of local `modal run` wrappers.
     from collections import deque
 
-    queue_cmd: deque[tuple[str, JobRecord]] = deque((jid, records[jid]) for jid, _ in jobs)
+    queue_cmd: deque[tuple[str, JobRecord]] = deque(
+        (jid, records[jid]) for jid, _ in jobs
+    )
     running: dict[int, tuple[subprocess.Popen, JobRecord]] = {}
     failures = 0
 
@@ -400,9 +479,19 @@ def main() -> int:
     )
     p.add_argument(
         "--only",
-        choices=("none", "naive"),
+        choices=("none", "naive", "medusa"),
         default=None,
-        help="Run only the no-spec or naive-spec sweep",
+        help="Run only one sweep family",
+    )
+    p.add_argument(
+        "--job-filter",
+        action="append",
+        default=None,
+        metavar="GLOB",
+        help=(
+            "Glob filter over job_id or full command; repeatable. "
+            "Examples: --job-filter 'medusa_*' --job-filter '*bs128*'"
+        ),
     )
     p.add_argument(
         "--dry-run",
@@ -432,6 +521,7 @@ def main() -> int:
         max_parallel=max(1, args.max_parallel),
         dry_run=args.dry_run,
         only=args.only,
+        job_filter=args.job_filter,
     )
 
 

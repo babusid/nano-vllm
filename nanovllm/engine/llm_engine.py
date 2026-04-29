@@ -532,10 +532,14 @@ class LLMEngine:
             num_tokens = -step_tokens_accepted
         else:
             # MEDUSA: proposals are all tree nodes (root + speculative nodes);
-            # accepted adds the root LM-head token to speculative accepts.
+            # accepted token accounting should reflect actual emitted tokens:
+            # root + accepted speculative tokens + optional bonus token
+            # (bonus is skipped for EOS sequences).
             medusa_len = self.medusa_buffers["medusa_len"]
             step_tokens_proposed = step_batch_size * medusa_len
-            step_tokens_accepted = step_batch_size + step_accepted
+            step_tokens_accepted = sum(
+                len(seq_token_ids) for seq_token_ids in token_ids
+            )
             num_tokens = -step_tokens_accepted
         # step_drafts/step_accepted are -1 for prefill and non-spec steps so
         # callers can distinguish "no spec this step" from a genuine 0-draft
