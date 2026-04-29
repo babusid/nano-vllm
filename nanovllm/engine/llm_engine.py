@@ -217,7 +217,7 @@ class LLMEngine:
 
     def _naive_specdec_step(
         self, seqs: list[Sequence], is_prefill: bool
-    ) -> tuple[list[list[int]], int, int]:
+    ) -> tuple[list[list[int]], int, int, list[int] | None]:
         # get the two model runners for regular specdec
         verifier_model_idx = 0
         drafter_model_idx = 1
@@ -230,7 +230,7 @@ class LLMEngine:
             with torch.profiler.record_function("spec.prefill.verifier_run"):
                 token_ids, _ = verifier.call("run", seqs, is_prefill)
             token_ids = [[tok] for tok in token_ids]
-            return token_ids, -1, -1
+            return token_ids, -1, -1, None
         else:
             # generate draft tokens
             for _ in range(self.speculation_length):
@@ -255,6 +255,7 @@ class LLMEngine:
             token_ids = []
             step_drafts = 0
             step_accepted = 0
+            seq_accepted_per_seq: list[int] = []
             with torch.profiler.record_function("spec.decode.accept_reject"):
                 for idx, seq in enumerate(seqs):
                     draft_tokens = seq.draft_token_ids[drafter_model_idx]
@@ -308,6 +309,7 @@ class LLMEngine:
                         assert len(big_token_ids) == len(draft_tokens) + 1
                         seq_accept.append(big_token_ids[-1])
                     step_accepted += seq_accepted_drafts
+                    seq_accepted_per_seq.append(seq_accepted_drafts)
                     if not seq_accept:
                         assert big_token_ids
                         seq_accept.append(big_token_ids[0])
@@ -319,7 +321,7 @@ class LLMEngine:
                 seq.draft_token_ids[1] = []
                 seq.draft_token_logits[1] = []
 
-            return token_ids, step_drafts, step_accepted
+            return token_ids, step_drafts, step_accepted, seq_accepted_per_seq
 
     # ------------------------------------------------------------------
     # MEDUSA step logic
@@ -495,6 +497,7 @@ class LLMEngine:
         with torch.profiler.record_function("llm.step.schedule"):
             seqs, is_prefill = self.scheduler.schedule()
         step_drafts = step_accepted = -1
+        step_seq_spec_accepted = None
 
         if self.speculation_mode is SpeculationMode.MEDUSA:
             with torch.profiler.record_function("medusa.step"):
@@ -504,9 +507,12 @@ class LLMEngine:
 
         elif self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             with torch.profiler.record_function("spec.step"):
-                token_ids, step_drafts, step_accepted = self._naive_specdec_step(
-                    seqs, is_prefill
-                )
+                (
+                    token_ids,
+                    step_drafts,
+                    step_accepted,
+                    step_seq_spec_accepted,
+                ) = self._naive_specdec_step(seqs, is_prefill)
         else:
             with torch.profiler.record_function("base.run"):
                 token_ids, _ = self.model_runners[0].call("run", seqs, is_prefill)
@@ -558,6 +564,7 @@ class LLMEngine:
             step_batch_size,
             step_tokens_accepted,
             step_tokens_proposed,
+            step_seq_spec_accepted,
         )
 
     def is_finished(self):
@@ -574,8 +581,8 @@ class LLMEngine:
         throughput_file = None
         throughput_writer = None
         cumulative_generated_tokens = 0
-        decode_len_hist: Counter[int] = Counter()
-        decode_len_samples = 0
+        spec_accepted_hist: Counter[int] = Counter()
+        spec_accepted_samples = 0
         if capture_throughput:
             throughput_file = open(throughput_path, "w", newline="", encoding="utf-8")
             throughput_writer = csv.writer(throughput_file)
@@ -610,6 +617,7 @@ class LLMEngine:
                     step_batch_size,
                     step_tokens_accepted,
                     step_tokens_proposed,
+                    step_seq_spec_accepted,
                 ) = self.step()
                 elapsed = perf_counter() - t
                 # accumulate spec metrics regardless of use_tqdm — caller dumps
@@ -629,11 +637,17 @@ class LLMEngine:
                     prefill_throughput = 0.0
                     decode_throughput = -num_tokens / elapsed
                     cumulative_generated_tokens += -num_tokens
-                    # Per-sequence decode emission histogram (global over run).
-                    # One contribution per active sequence per decode step.
-                    for emitted in step_seq_emitted:
-                        decode_len_hist[emitted] += 1
-                        decode_len_samples += 1
+
+                    # Naive speculation: per-sequence accepted speculative-token
+                    # histogram (excludes verifier/fallback token), comparable
+                    # across speculation lengths.
+                    if (
+                        self.speculation_mode is SpeculationMode.NAIVE_SPECULATION
+                        and step_seq_spec_accepted is not None
+                    ):
+                        for accepted in step_seq_spec_accepted:
+                            spec_accepted_hist[int(accepted)] += 1
+                            spec_accepted_samples += 1
 
                 if throughput_writer is not None:
                     throughput_writer.writerow(
@@ -665,32 +679,50 @@ class LLMEngine:
                 throughput_file.close()
             if capture_throughput:
                 hist_path = f"{throughput_path}.hist.json"
-                hist_items = sorted(
-                    (int(k), int(v)) for k, v in decode_len_hist.items()
-                )
-                total = sum(k * v for k, v in hist_items)
-                mean = (total / decode_len_samples) if decode_len_samples > 0 else 0.0
-
-                def _quantile_from_hist(q: float) -> int:
-                    if decode_len_samples <= 0:
-                        return 0
-                    target = int((decode_len_samples - 1) * q)
-                    running = 0
-                    for k, v in hist_items:
-                        running += v
-                        if running > target:
-                            return k
-                    return hist_items[-1][0]
-
                 payload = {
-                    "num_samples": decode_len_samples,
-                    "hist": {str(k): v for k, v in hist_items},
-                    "mean": mean,
-                    "median": _quantile_from_hist(0.5),
-                    "p90": _quantile_from_hist(0.9),
-                    "p95": _quantile_from_hist(0.95),
                     "spec_mode": self.speculation_mode.value,
                 }
+                if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+                    accepted_items = sorted(
+                        (int(k), int(v)) for k, v in spec_accepted_hist.items()
+                    )
+                    accepted_total = sum(k * v for k, v in accepted_items)
+                    accepted_mean = (
+                        accepted_total / spec_accepted_samples
+                        if spec_accepted_samples > 0
+                        else 0.0
+                    )
+
+                    def _quantile_from_items(
+                        items: list[tuple[int, int]], samples: int, q: float
+                    ) -> int:
+                        if samples <= 0:
+                            return 0
+                        target = int((samples - 1) * q)
+                        running = 0
+                        for k, v in items:
+                            running += v
+                            if running > target:
+                                return k
+                        return items[-1][0]
+
+                    payload["accepted_spec_tokens"] = {
+                        "num_samples": spec_accepted_samples,
+                        "hist": {str(k): v for k, v in accepted_items},
+                        "mean": accepted_mean,
+                        "median": _quantile_from_items(
+                            accepted_items, spec_accepted_samples, 0.5
+                        ),
+                        "p90": _quantile_from_items(
+                            accepted_items, spec_accepted_samples, 0.9
+                        ),
+                        "p95": _quantile_from_items(
+                            accepted_items, spec_accepted_samples, 0.95
+                        ),
+                        "p99": _quantile_from_items(
+                            accepted_items, spec_accepted_samples, 0.99
+                        ),
+                    }
                 with open(hist_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]

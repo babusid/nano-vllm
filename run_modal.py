@@ -80,7 +80,7 @@ app = modal.App("nano-vllm-runner")
 
 hf_volume = modal.Volume.from_name("nano-vllm-hf-cache", create_if_missing=True)
 trace_volume = modal.Volume.from_name(
-    "nano-vllm-profiler-traces-3", create_if_missing=True
+    "nano-vllm-profiler-traces-4", create_if_missing=True
 )
 sharegpt_volume = modal.Volume.from_name("nano-vllm-sharegpt", create_if_missing=True)
 arc_volume = modal.Volume.from_name("nano-vllm-arc", create_if_missing=True)
