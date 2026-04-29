@@ -329,7 +329,7 @@ class LLMEngine:
 
     def _medusa_step(
         self, seqs: list[Sequence], is_prefill: bool
-    ) -> tuple[list[list[int]], int, int]:
+    ) -> tuple[list[list[int]], int, int, list[int] | None]:
         """Execute one MEDUSA engine step for a batch of sequences.
 
         The entire step runs in a single batched pipeline with exactly one
@@ -363,7 +363,7 @@ class LLMEngine:
             for seq in seqs:
                 seq.medusa_lm_logits = None
                 seq.medusa_head_logits = None
-            return [[tok] for tok in token_ids], -1, -1
+            return [[tok] for tok in token_ids], -1, -1, None
 
         # ---- Decode (any batch size) ----
         B = len(seqs)
@@ -491,7 +491,8 @@ class LLMEngine:
 
         step_drafts = B * (medusa_len - 1)
         step_accepted = total_accepted
-        return out_tokens, step_drafts, step_accepted
+        step_seq_spec_accepted = [int(row[0]) for row in packed_cpu]
+        return out_tokens, step_drafts, step_accepted, step_seq_spec_accepted
 
     def step(self):
         with torch.profiler.record_function("llm.step.schedule"):
@@ -501,9 +502,12 @@ class LLMEngine:
 
         if self.speculation_mode is SpeculationMode.MEDUSA:
             with torch.profiler.record_function("medusa.step"):
-                token_ids, step_drafts, step_accepted = self._medusa_step(
-                    seqs, is_prefill
-                )
+                (
+                    token_ids,
+                    step_drafts,
+                    step_accepted,
+                    step_seq_spec_accepted,
+                ) = self._medusa_step(seqs, is_prefill)
 
         elif self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
             with torch.profiler.record_function("spec.step"):
@@ -638,11 +642,14 @@ class LLMEngine:
                     decode_throughput = -num_tokens / elapsed
                     cumulative_generated_tokens += -num_tokens
 
-                    # Naive speculation: per-sequence accepted speculative-token
-                    # histogram (excludes verifier/fallback token), comparable
-                    # across speculation lengths.
+                    # Speculative modes: per-sequence accepted speculative-token
+                    # histogram, comparable across speculation lengths.
                     if (
-                        self.speculation_mode is SpeculationMode.NAIVE_SPECULATION
+                        self.speculation_mode
+                        in {
+                            SpeculationMode.NAIVE_SPECULATION,
+                            SpeculationMode.MEDUSA,
+                        }
                         and step_seq_spec_accepted is not None
                     ):
                         for accepted in step_seq_spec_accepted:
@@ -682,7 +689,10 @@ class LLMEngine:
                 payload = {
                     "spec_mode": self.speculation_mode.value,
                 }
-                if self.speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+                if self.speculation_mode in {
+                    SpeculationMode.NAIVE_SPECULATION,
+                    SpeculationMode.MEDUSA,
+                }:
                     accepted_items = sorted(
                         (int(k), int(v)) for k, v in spec_accepted_hist.items()
                     )
