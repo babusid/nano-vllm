@@ -14,19 +14,26 @@ class Scheduler:
         speculation_mode: SpeculationMode = SpeculationMode.NONE,
         speculator_config: list[Config] | None = None,
         speculation_length: int | None = None,
+        medusa_len: int | None = None,
     ):
         self.speculation_mode = speculation_mode
         self.speculator_config = speculator_config
         self.speculation_length = speculation_length
-        _spec_conf = [
-            self.speculation_mode is not SpeculationMode.NONE,
-            self.speculator_config,
-            self.speculation_length,
-        ]
-        if any(_spec_conf) and not all(_spec_conf):
-            raise ValueError(
-                "Speculation mode, speculator config and speculation length must be specified together"
-            )
+        self.medusa_len = medusa_len
+
+        # Naive spec-dec requires both a speculator config and a draft length.
+        # MEDUSA mode uses neither (it has no separate draft model).
+        if speculation_mode is SpeculationMode.NAIVE_SPECULATION:
+            if not speculator_config or not speculation_length:
+                raise ValueError(
+                    "Speculation mode, speculator config and speculation length "
+                    "must be specified together for naive speculation"
+                )
+        if speculation_mode is SpeculationMode.MEDUSA:
+            if not medusa_len:
+                raise ValueError(
+                    "medusa_len must be provided when using MEDUSA speculation mode"
+                )
 
         self.max_num_seqs = config.max_num_seqs  # batch size in sequences
         self.max_num_batched_tokens = (
@@ -107,7 +114,9 @@ class Scheduler:
             # add 1 to the speculation length to account for the bonus token
             # from the verifier
             speculation_tokens = self.speculation_length + 1
-            # speculation_tokens = self.speculation_length
+        elif self.speculation_mode is SpeculationMode.MEDUSA:
+            # reserve medusa_len slots: one for each tree candidate position
+            speculation_tokens = self.medusa_len
 
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()  # pop head of queue from running list
@@ -160,12 +169,15 @@ class Scheduler:
         it's remvoed from the waiting list, and its KV cache is deallocated.
         """
         for seq, token_ids in zip(seqs, seqs_token_ids):
+            # Truncate at the first EOS so that tokens generated after EOS
+            # (e.g. the bonus token in speculative decoding) are not committed.
+            # Standard decode is never affected (it commits exactly 1 token).
+            if not seq.ignore_eos and self.eos in token_ids:
+                eos_idx = token_ids.index(self.eos)
+                token_ids = token_ids[: eos_idx + 1]
             seq.extend(token_ids)
             if (
-                (
-                    not seq.ignore_eos
-                    and any(token_id == self.eos for token_id in token_ids)
-                )
+                (not seq.ignore_eos and token_ids[-1] == self.eos)
                 or seq.num_completion_tokens >= seq.max_tokens
                 or len(seq) >= self.max_model_len
             ):

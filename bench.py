@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import random
@@ -61,6 +62,68 @@ def load_sharegpt_prompts(
     return prompts, sampling_params
 
 
+def enrich_throughput_csv(
+    path: str,
+    spec_mode: str,
+    bench_max_batch_size: int,
+    spec_len: int,
+    medusa_num_heads: int,
+) -> None:
+    if not os.path.isfile(path):
+        print(f"Throughput CSV not found, skipping enrichment: {path}")
+        return
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        if reader.fieldnames is None:
+            print(f"Throughput CSV has no header, skipping enrichment: {path}")
+            return
+        fieldnames = list(reader.fieldnames)
+
+    extra_columns = [
+        "spec_mode",
+        "bench_max_batch_size",
+        "spec_len",
+        "medusa_num_heads",
+        "mean_tokens_accepted_per_seq",
+        "token_acceptance_pct",
+    ]
+    for col in extra_columns:
+        if col not in fieldnames:
+            fieldnames.append(col)
+
+    for row in rows:
+        row["spec_mode"] = spec_mode
+        row["bench_max_batch_size"] = str(bench_max_batch_size)
+        row["spec_len"] = str(spec_len)
+        row["medusa_num_heads"] = str(medusa_num_heads)
+
+        step_batch_size = int(row.get("step_batch_size", "-1"))
+        step_tokens_accepted = float(row.get("step_tokens_accepted", "-1"))
+        step_tokens_proposed = float(row.get("step_tokens_proposed", "-1"))
+
+        if step_batch_size > 0 and step_tokens_accepted >= 0:
+            mean_tokens_accepted = step_tokens_accepted / step_batch_size
+            row["mean_tokens_accepted_per_seq"] = f"{mean_tokens_accepted:.6f}"
+        else:
+            row["mean_tokens_accepted_per_seq"] = "-1"
+
+        if step_tokens_proposed > 0 and step_tokens_accepted >= 0:
+            row["token_acceptance_pct"] = (
+                f"{(step_tokens_accepted / step_tokens_proposed):.6f}"
+            )
+        else:
+            row["token_acceptance_pct"] = "-1"
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Enriched throughput CSV in place: {path}")
+
+
 def bench():
     dataset_path = os.environ.get(
         "SHAREGPT_PATH", "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -96,27 +159,36 @@ def bench():
     # speculation config comes from env so run_modal.py flags can propagate
     spec_mode_str = os.environ.get("SPEC_MODE", "none").lower()
     spec_length = int(os.environ.get("SPEC_LENGTH", "1"))
-    use_spec = spec_mode_str == "naive"
-    print(f"Spec: mode={spec_mode_str} length={spec_length if use_spec else '-'}")
+    use_naive = spec_mode_str == "naive"
+    use_medusa = spec_mode_str == "medusa"
+    medusa_num_heads = 0
+    print(f"Spec: mode={spec_mode_str} length={spec_length if use_naive else '-'}")
 
     # size memory pool to add up to 90% of GPU memory
     main_model_path = os.path.expanduser(
         os.environ.get("MAIN_MODEL_PATH")
         or os.environ.get("MODEL_PATH", "~/huggingface/Qwen3-0.8B/")
     )
+    # BENCH_MAX_BATCH_SIZE lets you cap the decode batch size.
+    # MEDUSA now batches up to this value like NONE/NAIVE; set to 1 if you
+    # want a fair per-sequence latency comparison.
+    max_batch_size = int(os.environ.get("BENCH_MAX_BATCH_SIZE", "512"))
+    print("Max batch size (decode batch cap): ", max_batch_size)
+
     main_model_config = Config(
         model=main_model_path,
         max_model_len=main_max_model_len,
         enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
         gpu_memory_utilization=main_gpu_memory_utilization,
+        max_num_seqs=max_batch_size,
     )
     print("Main Model Path: ", main_model_path)
 
-    # only construct the speculator config when naive spec is requested —
+    # only construct the speculator config when a spec mode is requested —
     # Config.__post_init__ hits the filesystem / HF cache, so skipping it
     # lets non-spec runs work without a speculator model present
     spec_kwargs = {}
-    if use_spec:
+    if use_naive:
         small_model_path = os.path.expanduser(
             os.environ.get("SPEC_MODEL_PATH", "~/huggingface/Qwen3-0.6B/")
         )
@@ -125,12 +197,47 @@ def bench():
             max_model_len=spec_max_model_len,
             enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
             gpu_memory_utilization=spec_gpu_memory_utilization,
+            max_num_seqs=max_batch_size,
         )
         print("Small Model Path: ", small_model_path)
         spec_kwargs = dict(
             speculation_mode=SpeculationMode.NAIVE_SPECULATION,
             speculator_config=[small_model_config],
             speculation_length=spec_length,
+        )
+    elif use_medusa:
+        from nanovllm.engine.medusa_utils import (
+            load_medusa_choices,
+            resolve_medusa_choices_file,
+        )
+
+        medusa_model_path = os.path.expanduser(os.environ.get("MEDUSA_MODEL_PATH", ""))
+        if not medusa_model_path:
+            raise ValueError(
+                "MEDUSA_MODEL_PATH env var must be set when SPEC_MODE=medusa"
+            )
+        medusa_raw = os.environ.get("MEDUSA_CHOICES", "").strip()
+        medusa_file = resolve_medusa_choices_file(medusa_raw)
+        medusa_choices = load_medusa_choices(medusa_raw)
+        medusa_num_heads = int(os.environ.get("MEDUSA_NUM_HEADS", "4"))
+        medusa_num_layers = int(os.environ.get("MEDUSA_NUM_LAYERS", "1"))
+        print("MEDUSA Model Path: ", medusa_model_path)
+        if medusa_choices is not None:
+            if medusa_file:
+                print(
+                    f"MEDUSA_CHOICES (file {medusa_file!r}, env={medusa_raw!r}): "
+                    f"{len(medusa_choices)} paths"
+                )
+            else:
+                print(f"MEDUSA_CHOICES (inline JSON): {len(medusa_choices)} paths")
+        else:
+            print("MEDUSA_CHOICES: (unset) using built-in default tree")
+        spec_kwargs = dict(
+            speculation_mode=SpeculationMode.MEDUSA,
+            medusa_model_path=medusa_model_path,
+            medusa_choices=medusa_choices,
+            medusa_num_heads=medusa_num_heads,
+            medusa_num_layers=medusa_num_layers,
         )
 
     print("Initializing LLM...")
@@ -153,18 +260,20 @@ def bench():
 
     # Warmup pass so kernel compilation/setup does not pollute benchmark timing.
     warmup_n = min(warmup_seqs, num_seqs)
-    llm.generate(prompts[:warmup_n], sampling_params[:warmup_n], use_tqdm=False)
-    torch.cuda.synchronize()
+    with torch.profiler.record_function("bench.warmup"):
+        llm.generate(prompts[:warmup_n], sampling_params[:warmup_n], use_tqdm=False)
+        torch.cuda.synchronize()
     print("Warmup done")
 
     print("Staring benchmark")
     # snapshot spec counters so warmup's drafts don't leak into the benchmark
     drafts_before = llm.spec_drafts_total
     accepted_before = llm.spec_accepted_total
-    t = time.time()
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
-    torch.cuda.synchronize()
-    t = time.time() - t
+    with torch.profiler.record_function("bench.benchmark"):
+        t = time.time()
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+        torch.cuda.synchronize()
+        t = time.time() - t
 
     total_tokens = sum(len(out["token_ids"]) for out in outputs)
     throughput = total_tokens / t
@@ -179,6 +288,18 @@ def bench():
             f"Spec: drafted={drafts}tok, accepted={accepted}tok, "
             f"acceptance={rate:.2%}"
         )
+
+    capture_throughput = os.environ.get("CAPTURE_THROUGHPUT_TRACE", "0") == "1"
+    throughput_path = os.environ.get("THROUGHPUT_TRACE_PATH", "/tmp/data.csv")
+    if capture_throughput:
+        enrich_throughput_csv(
+            path=throughput_path,
+            spec_mode=spec_mode_str,
+            bench_max_batch_size=max_batch_size,
+            spec_len=spec_length if use_naive else 0,
+            medusa_num_heads=medusa_num_heads if use_medusa else 0,
+        )
+
     print("Benchmark done")
 
 

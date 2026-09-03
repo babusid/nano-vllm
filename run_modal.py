@@ -20,17 +20,26 @@ Usage:
     # Run benchmark with naive speculation, length 8
     modal run run_modal.py --target bench --spec-mode naive --spec-length 8
 
+    # Run benchmark with MEDUSA speculative decoding
+    modal run run_modal.py --target bench --spec-mode medusa --spec-model "FasterDecoding/medusa-vicuna-7b-v1.3"
+
     # Run benchmark with custom models
     modal run run_modal.py --target bench --main-model "Qwen/Qwen3-8B" --spec-model "Qwen/Qwen3-0.6B"
 
     # Run example with custom model and revision
     modal run run_modal.py --target example --main-model "Qwen/Qwen3-0.6B" --main-revision "main"
 
-    # Profile full bench.py execution (CPU + CUDA) and save trace JSON to Modal volume
+    # Profile full bench.py execution (CPU-only by default) and save trace JSON to Modal volume
     modal run run_modal.py --target bench --profile
+
+    # Include CUDA activity events too (larger trace, slower export)
+    modal run run_modal.py --target bench --profile --profile-cuda
 
     # Profile with eager kernels (no CUDA graph replay)
     modal run run_modal.py --target bench --profile --enforce-eager
+
+    # Capture per-step prefill/decode throughput CSV
+    modal run run_modal.py --target bench --data-capture
 
     # Disabled (can deadlock): Python stack traces in profiler events
     # modal run run_modal.py --target bench --profile --profile-with-stack
@@ -47,11 +56,15 @@ Profiling flags:
         Record tensor shapes for profiled ops.
     --profile-memory
         Record memory usage events.
+    --profile-cuda
+        Include CUDA activity events in the trace (disabled by default).
     # --profile-with-stack (disabled)
     #     Record Python stack traces for events; useful for attribution but slower.
     #     Disabled due to deadlocks/stalls during profiling finalization/export.
     --enforce-eager
         Disable CUDA graph replay during execution (independent of --profile).
+    --data-capture / --trace-throughput
+        Capture per-step throughput metrics into data.csv on the Modal trace volume.
 """
 
 from __future__ import annotations
@@ -61,12 +74,13 @@ from pathlib import Path
 from uuid import uuid4
 import sys
 import modal
+import shutil
 
 app = modal.App("nano-vllm-runner")
 
 hf_volume = modal.Volume.from_name("nano-vllm-hf-cache", create_if_missing=True)
 trace_volume = modal.Volume.from_name(
-    "nano-vllm-profiler-traces", create_if_missing=True
+    "nano-vllm-profiler-traces-4", create_if_missing=True
 )
 sharegpt_volume = modal.Volume.from_name("nano-vllm-sharegpt", create_if_missing=True)
 arc_volume = modal.Volume.from_name("nano-vllm-arc", create_if_missing=True)
@@ -97,7 +111,15 @@ image = (
     .add_local_dir(
         ".",
         remote_path="/workspace",
-        ignore=[".git", "__pycache__", ".venv", "*.pyc"],
+        ignore=[
+            ".git",
+            "__pycache__",
+            ".venv",
+            "*.pyc",
+            # Local ablation scripts write logs here while other `modal run` syncs the tree;
+            # tracking it causes "modified during build process" race errors.
+            "modal_throughput_ablations",
+        ],
     )
 )
 
@@ -176,18 +198,27 @@ def run_target(
     spec_revision: str = "",
     spec_mode: str = "none",
     spec_length: int = 1,
+    # MEDUSA-specific
+    # JSON array of paths, or a path to a .json file (see load_medusa_choices).
+    medusa_choices: str = "",
+    medusa_num_heads: int = 4,
+    medusa_num_layers: int = 1,
     profile: bool = False,
     profile_label: str = "",
     profile_record_shapes: bool = True,
     profile_memory: bool = False,
+    profile_cuda: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
+    data_capture: bool = False,
+    trace_throughput: bool = False,
     bench_num_seqs: int = 64,
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
     bench_seed: int = 0,
     bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
+    bench_max_batch_size: int = 512,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
@@ -220,12 +251,18 @@ def run_target(
             f"target must be one of ['bench', 'example', 'arc'], got {target!r}"
         )
     spec_mode_norm = spec_mode.lower()
-    if spec_mode_norm not in {"none", "naive"}:
+    if spec_mode_norm not in {"none", "naive", "medusa"}:
         raise ValueError(
-            f"spec_mode must be one of ['none', 'naive'], got {spec_mode!r}"
+            f"spec_mode must be one of ['none', 'naive', 'medusa'], got {spec_mode!r}"
         )
-    if spec_length < 1:
-        raise ValueError(f"spec_length must be >= 1, got {spec_length}")
+    if spec_length < 0:
+        raise ValueError(f"spec_length must be >= 0, got {spec_length}")
+    if spec_length < 1 and spec_mode_norm in {"naive", "medusa"}:
+        raise ValueError(
+            f"spec_length must be >= 1 when spec_mode is naive or medusa, got {spec_length}"
+        )
+    if spec_mode_norm == "medusa" and not spec_model:
+        raise ValueError("--spec-model is required when --spec-mode medusa")
     # if profile and profile_with_stack and not enforce_eager:
     #     print(
     #         "Profiler warning: disabling --profile-with-stack in CUDA graph mode "
@@ -235,16 +272,32 @@ def run_target(
     #     profile_with_stack = False
 
     print("Target: ", target)
-    print(f"Spec: mode={spec_mode_norm} length={spec_length}")
+    print(
+        f"Spec: mode={spec_mode_norm} length={spec_length if spec_mode_norm == 'naive' else '-'}"
+    )
     print(f"Profiler: enabled={profile}")
+    print(f"Profiler: cuda_events={profile_cuda}")
     print(f"Enforce eager: {enforce_eager}")
+    throughput_capture_enabled = data_capture or trace_throughput
+    throughput_tmp_path = "/tmp/data.csv"
+    print(f"Throughput trace: enabled={throughput_capture_enabled}")
+    os.environ["CAPTURE_THROUGHPUT_TRACE"] = "1" if throughput_capture_enabled else "0"
+    if throughput_capture_enabled:
+        os.environ["THROUGHPUT_TRACE_PATH"] = throughput_tmp_path
 
     main_repo = main_model or "Qwen/Qwen3-8B"
     os.environ["MAIN_MODEL_PATH"] = _download_model(main_repo, main_revision)
-    # only pull the speculator when we're actually going to use it
-    if spec_mode_norm != "none":
+
+    # Pull the speculator / MEDUSA checkpoint only when needed.
+    if spec_mode_norm == "naive":
         spec_repo = spec_model or "Qwen/Qwen3-0.6B"
         os.environ["SPEC_MODEL_PATH"] = _download_model(spec_repo, spec_revision)
+    elif spec_mode_norm == "medusa":
+        os.environ["MEDUSA_MODEL_PATH"] = _download_model(spec_model, spec_revision)
+        if medusa_choices:
+            os.environ["MEDUSA_CHOICES"] = medusa_choices
+        os.environ["MEDUSA_NUM_HEADS"] = str(medusa_num_heads)
+        os.environ["MEDUSA_NUM_LAYERS"] = str(medusa_num_layers)
 
     # propagate spec config to the target script via env
     os.environ["SPEC_MODE"] = spec_mode_norm
@@ -257,6 +310,7 @@ def run_target(
         os.environ["BENCH_SEED"] = str(bench_seed)
         os.environ["BENCH_TEMPERATURE"] = str(bench_temperature)
         os.environ["BENCH_WARMUP_SEQS"] = str(bench_warmup_seqs)
+        os.environ["BENCH_MAX_BATCH_SIZE"] = str(bench_max_batch_size)
         os.environ["BENCH_MAIN_MAX_MODEL_LEN"] = str(bench_main_max_model_len)
         os.environ["BENCH_MAIN_GPU_MEMORY_UTILIZATION"] = str(
             bench_main_gpu_memory_utilization
@@ -304,34 +358,60 @@ def run_target(
     if not os.path.isfile(script_path):
         script_path = f"/{script_name}"
 
-    if not profile:
-        runpy.run_path(script_path, run_name="__main__")
-        return
-
     profile_tag = (profile_label.strip() or target).replace("/", "-")
     timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     run_id = uuid4().hex[:8]
-    output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = output_dir / "trace.pt.trace.json"
+    output_dir = None
+    if profile or throughput_capture_enabled:
+        output_dir = TRACE_DIR / f"{profile_tag}-{timestamp}-{run_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=profile_record_shapes,
-        profile_memory=profile_memory,
-        # with_stack=profile_with_stack,
-        with_stack=False,
-    ) as prof:
+    wrote_artifact = False
+    if not profile:
         runpy.run_path(script_path, run_name="__main__")
+    else:
+        trace_path = output_dir / "trace.pt.trace.json"
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if profile_cuda:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-    torch.cuda.synchronize()
-    print(f"Exporting profiler trace to {trace_path}...")
-    prof.export_chrome_trace(str(trace_path))
-    trace_volume.commit()
-    print(f"Profiler trace saved to modal volume: {trace_path}")
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=profile_record_shapes,
+            profile_memory=profile_memory,
+            # with_stack=profile_with_stack,
+            with_stack=False,
+        ) as prof:
+            runpy.run_path(script_path, run_name="__main__")
+
+        torch.cuda.synchronize()
+        print(f"Exporting profiler trace to {trace_path}...")
+        # prof.export_chrome_trace(str(trace_path))
+        prof.export_chrome_trace("/tmp/run.trace.pt.trace.json")
+        print("Finished exporting, copying to modal volume...")
+        _ = shutil.copy("/tmp/run.trace.pt.trace.json", str(trace_path))
+        print(f"Profiler trace saved to modal volume: {trace_path}")
+        wrote_artifact = True
+
+    if throughput_capture_enabled:
+        data_path = output_dir / "data.csv"
+        if not os.path.isfile(throughput_tmp_path):
+            raise FileNotFoundError(
+                f"Throughput trace requested but no file found at {throughput_tmp_path}"
+            )
+        _ = shutil.copy(throughput_tmp_path, str(data_path))
+        print(f"Throughput data saved to modal volume: {data_path}")
+        hist_tmp_path = f"{throughput_tmp_path}.hist.json"
+        if os.path.isfile(hist_tmp_path):
+            hist_path = output_dir / "decode_len_hist.json"
+            _ = shutil.copy(hist_tmp_path, str(hist_path))
+            print(f"Decode histogram saved to modal volume: {hist_path}")
+        wrote_artifact = True
+
+    if wrote_artifact:
+        print("Committing artifacts to modal volume...")
+        trace_volume.commit()
+        print(f"Artifacts committed under {output_dir}")
 
 
 @app.local_entrypoint()
@@ -339,22 +419,31 @@ def main(
     target: str = "bench",
     main_model: str = "Qwen/Qwen3-8B",
     main_revision: str = "",
-    spec_model: str = "Qwen/Qwen3-0.6B",
+    spec_model: str = "",
     spec_revision: str = "",
     spec_mode: str = "none",
     spec_length: int = 1,
+    # MEDUSA-specific
+    # JSON array of paths, or a path to a .json file (see load_medusa_choices).
+    medusa_choices: str = "",
+    medusa_num_heads: int = 4,
+    medusa_num_layers: int = 1,
     profile: bool = False,
     profile_label: str = "",
     profile_record_shapes: bool = True,
     profile_memory: bool = False,
+    profile_cuda: bool = False,
     # profile_with_stack: bool = False,
     enforce_eager: bool = False,
+    data_capture: bool = False,
+    trace_throughput: bool = False,
     bench_num_seqs: int = 64,
     bench_max_input_len: int = 1024,
     bench_max_output_len: int = 1024,
     bench_seed: int = 0,
     bench_temperature: float = 0.0,
     bench_warmup_seqs: int = 32,
+    bench_max_batch_size: int = 512,
     bench_main_max_model_len: int = 4096,
     bench_main_gpu_memory_utilization: float = 0.8,
     bench_spec_max_model_len: int = 4096,
@@ -386,18 +475,25 @@ def main(
             spec_revision,
             spec_mode,
             spec_length,
+            medusa_choices,
+            medusa_num_heads,
+            medusa_num_layers,
             profile,
             profile_label,
             profile_record_shapes,
             profile_memory,
+            profile_cuda,
             # profile_with_stack,
             enforce_eager,
+            data_capture,
+            trace_throughput,
             bench_num_seqs,
             bench_max_input_len,
             bench_max_output_len,
             bench_seed,
             bench_temperature,
             bench_warmup_seqs,
+            bench_max_batch_size,
             bench_main_max_model_len,
             bench_main_gpu_memory_utilization,
             bench_spec_max_model_len,

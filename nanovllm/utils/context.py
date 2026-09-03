@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 
 
@@ -14,6 +14,14 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    # MEDUSA tree-decode fields — only set when is_medusa_tree_decode=True
+    is_medusa_tree_decode: bool = False
+    # Additive bias [1, 1, medusa_len, medusa_len]: 0 for allowed, -inf for masked.
+    # Pre-computed once from medusa_choices and reused every step.
+    medusa_tree_mask: torch.Tensor | None = None
+    # Committed-only sequence lengths [bs] used by the prefix FA call so that
+    # the attention ignores the reserved tree slots already written to the cache.
+    prefix_lens: torch.Tensor | None = None
 
 
 _CONTEXT = Context()
@@ -32,6 +40,9 @@ def set_context(
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
+    is_medusa_tree_decode=False,
+    medusa_tree_mask=None,
+    prefix_lens=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -43,6 +54,9 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
+        is_medusa_tree_decode,
+        medusa_tree_mask,
+        prefix_lens,
     )
 
 

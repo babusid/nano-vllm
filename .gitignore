@@ -196,3 +196,9 @@ cython_debug/
 
 # Pytorch traces
 traces/
+
+medusa_repo/
+
+dashboard.json
+__init__.py
+modal_throughput_ablations/
